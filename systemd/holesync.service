@@ -1,0 +1,15 @@
+[Unit]
+Description=holesync — replicate Pi-hole v6 local DNS records to replicas
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/holesync -c /etc/holesync/holesync.conf
+Nice=10
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/holesync /var/log

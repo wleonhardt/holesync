@@ -1,0 +1,41 @@
+# holesync configuration — copy to /etc/holesync/holesync.conf and chmod 600.
+# Secrets live in this file, so keep it out of version control.
+
+# The authoritative Pi-hole. holesync reads from here and never writes to it.
+[source]
+url = http://10.0.0.10
+password = CHANGEME
+# password_file = /etc/holesync/source.pw   ; alternative to inline password
+
+# One [replica:<name>] section per Pi-hole to keep in sync with the source.
+[replica:pihole-02]
+url = http://10.0.0.11
+password = CHANGEME
+# password_file = /etc/holesync/pihole-02.pw
+
+# Add more replicas freely:
+# [replica:pihole-03]
+# url = http://10.0.0.12
+# password = CHANGEME
+
+[sync]
+# Which record types to replicate.
+hosts = true          ; local A/AAAA records (dns.hosts)
+cnames = true         ; local CNAMEs (dns.cnameRecords)
+# HTTP behaviour
+timeout = 8           ; seconds per request
+retries = 3           ; attempts per request (exponential backoff on 5xx/429/conn)
+verify_tls = true     ; set false only for self-signed https Pi-holes
+
+[safety]
+# Corruption guards. These protect a healthy replica from a glitchy source.
+min_hosts = 1         ; refuse to sync if the source reports fewer host records
+max_shrink_pct = 50   ; refuse a write that shrinks the replica's set by > this %
+                      ; (override for a genuine bulk delete with --force)
+backup_dir = /var/lib/holesync/backups   ; replica state is saved here before a write
+backup_keep = 30      ; rotations to retain per replica
+
+[log]
+file = /var/log/holesync.log
+level = info          ; debug|info|warning|error
+lockfile = /tmp/holesync.lock

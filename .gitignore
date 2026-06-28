@@ -1,0 +1,14 @@
+# Real config holds passwords — never commit it.
+holesync.conf
+*.pw
+*.secret
+
+# Local backups / logs
+backups/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
