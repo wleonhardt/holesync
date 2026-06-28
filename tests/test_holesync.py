@@ -137,7 +137,7 @@ class TestProcessReplica(unittest.TestCase):
         fake = FakeClient(state)
         self._patch_client(fake)
         src = hs.DnsRecords(hosts=["10.0.0.1 a"])
-        res = hs.process_replica(self.rcfg, src, self.opts, "stamp")
+        res = hs.process_replica(self.rcfg, hs.SourceState(dns=src), self.opts, "stamp")
         self.assertTrue(res.ok)
         self.assertTrue(res.in_sync)
         self.assertEqual(fake.patches, [])  # never wrote
@@ -146,7 +146,7 @@ class TestProcessReplica(unittest.TestCase):
         fake = FakeClient(hs.DnsRecords(hosts=["10.0.0.1 a", "10.0.0.2 b"]))
         self._patch_client(fake)
         src = hs.DnsRecords(hosts=["10.0.0.1 a", "10.0.0.2 b", "10.0.0.3 c"])
-        res = hs.process_replica(self.rcfg, src, self.opts, "stamp")
+        res = hs.process_replica(self.rcfg, hs.SourceState(dns=src), self.opts, "stamp")
         self.assertTrue(res.ok)
         self.assertTrue(res.changed)
         self.assertEqual(len(fake.patches), 1)
@@ -157,7 +157,7 @@ class TestProcessReplica(unittest.TestCase):
         fake = FakeClient(hs.DnsRecords(hosts=["10.0.0.1 a"]))
         self._patch_client(fake)
         src = hs.DnsRecords(hosts=["10.0.0.1 a", "10.0.0.2 b"])
-        res = hs.process_replica(self.rcfg, src, self.opts, "stamp")
+        res = hs.process_replica(self.rcfg, hs.SourceState(dns=src), self.opts, "stamp")
         self.assertTrue(res.ok)
         self.assertFalse(res.changed)
         self.assertEqual(fake.patches, [])
@@ -166,7 +166,7 @@ class TestProcessReplica(unittest.TestCase):
         fake = FakeClient(hs.DnsRecords(hosts=["10.0.0.%d h%d" % (i, i) for i in range(10)]))
         self._patch_client(fake)
         src = hs.DnsRecords(hosts=["10.0.0.1 a"])
-        res = hs.process_replica(self.rcfg, src, self.opts, "stamp")
+        res = hs.process_replica(self.rcfg, hs.SourceState(dns=src), self.opts, "stamp")
         self.assertFalse(res.ok)
         self.assertEqual(res.code, 3)
         self.assertEqual(fake.patches, [])
@@ -176,12 +176,131 @@ class TestProcessReplica(unittest.TestCase):
         fake = FakeClient(original, fail_verify=True)
         self._patch_client(fake)
         src = hs.DnsRecords(hosts=["10.0.0.1 a", "10.0.0.2 b", "10.0.0.3 c"])
-        res = hs.process_replica(self.rcfg, src, self.opts, "stamp")
+        res = hs.process_replica(self.rcfg, hs.SourceState(dns=src), self.opts, "stamp")
         self.assertFalse(res.ok)
         self.assertEqual(res.code, 4)
         # Two patches: the failed write, then the rollback.
         self.assertEqual(len(fake.patches), 2)
         self.assertIn("rollback succeeded", res.reason)
+
+
+class TestGroupMapping(unittest.TestCase):
+    def test_group_maps(self):
+        items = [{"id": 0, "name": "Default"}, {"id": 3, "name": "Kids"}]
+        id2name, name2id = hs.group_maps(items)
+        self.assertEqual(id2name, {0: "Default", 3: "Kids"})
+        self.assertEqual(name2id, {"Default": 0, "Kids": 3})
+
+    def test_translate_groups_by_name(self):
+        # Source: Kids=3. Replica: Kids=7. A source item on group 3 must map to 7.
+        src_id2name = {0: "Default", 3: "Kids"}
+        dst_name2id = {"Default": 0, "Kids": 7}
+        item = {"groups": [3]}
+        self.assertEqual(hs._translate_groups(item, src_id2name, dst_name2id), [7])
+
+    def test_translate_drops_unknown_group(self):
+        # A source group with no matching name on the replica is dropped, not guessed.
+        item = {"groups": [9]}
+        self.assertEqual(hs._translate_groups(item, {9: "Ghost"}, {"Default": 0}), [])
+
+
+class TestPlanCollection(unittest.TestCase):
+    def setUp(self):
+        # Same group ids on both sides for simplicity.
+        self.s_id2name = {0: "Default"}
+        self.d_id2name = {0: "Default"}
+
+    def test_add_update_delete_domains(self):
+        def dom(d, enabled=True, comment=""):
+            return {"type": "allow", "kind": "exact", "domain": d,
+                    "enabled": enabled, "comment": comment, "groups": [0]}
+        source = [dom("a.com"), dom("b.com", enabled=False)]
+        current = [dom("a.com"), dom("c.com")]
+        add, upd, dele = hs.plan_collection(hs.DOMAINS, source, current,
+                                            self.s_id2name, self.d_id2name)
+        self.assertEqual([x["domain"] for x in add], ["b.com"])
+        self.assertEqual([x["domain"] for x in dele], ["c.com"])
+        self.assertEqual(upd, [])  # a.com identical on both
+
+    def test_update_detected_on_enabled_change(self):
+        def dom(enabled):
+            return {"type": "deny", "kind": "exact", "domain": "x.com",
+                    "enabled": enabled, "comment": "", "groups": [0]}
+        add, upd, dele = hs.plan_collection(hs.DOMAINS, [dom(False)], [dom(True)],
+                                            self.s_id2name, self.d_id2name)
+        self.assertEqual(len(upd), 1)
+        self.assertEqual(add, [])
+        self.assertEqual(dele, [])
+
+    def test_group_membership_change_is_an_update(self):
+        # Same domain, different group name set -> update.
+        src_id2name = {0: "Default", 1: "Kids"}
+        dst_id2name = {0: "Default", 5: "Kids"}
+        s = [{"type": "allow", "kind": "exact", "domain": "x", "enabled": True,
+              "comment": "", "groups": [0, 1]}]
+        c = [{"type": "allow", "kind": "exact", "domain": "x", "enabled": True,
+              "comment": "", "groups": [0]}]
+        add, upd, dele = hs.plan_collection(hs.DOMAINS, s, c, src_id2name, dst_id2name)
+        self.assertEqual(len(upd), 1)
+
+    def test_default_group_protected_from_delete(self):
+        source = []  # source has no groups
+        current = [{"id": 0, "name": "Default", "enabled": True, "comment": ""},
+                   {"id": 4, "name": "Kids", "enabled": True, "comment": ""}]
+        add, upd, dele = hs.plan_collection(hs.GROUPS, source, current, {}, {})
+        names = [x["name"] for x in dele]
+        self.assertIn("Kids", names)
+        self.assertNotIn("Default", names)  # never deleted
+
+
+class FakeCollClient:
+    name = "fake"
+
+    def __init__(self, items_by_kind):
+        self.items_by_kind = items_by_kind
+        self.writes = []
+
+    def get_collection(self, kind):
+        return list(self.items_by_kind.get(kind, []))
+
+    def write_item(self, m, p, b):
+        self.writes.append((m, p, b))
+        return 200, {}
+
+
+class TestCollectionGuards(unittest.TestCase):
+    def _dom(self, d):
+        return {"type": "allow", "kind": "exact", "domain": d,
+                "enabled": True, "comment": "", "groups": [0]}
+
+    def test_change_cap_aborts_bulk(self):
+        opts = hs.Options(max_changes=25, backup_dir="")
+        client = FakeCollClient({"domains": []})
+        source = [self._dom("d%d.com" % i) for i in range(40)]  # 40 adds > 25
+        with self.assertRaises(hs.SafetyAbort):
+            hs.sync_collection(client, hs.DOMAINS, source, opts, {0: "Default"},
+                               {"Default": 0}, {0: "Default"}, "stamp")
+        self.assertEqual(client.writes, [])  # nothing written
+
+    def test_shrink_guard_aborts_mass_delete(self):
+        opts = hs.Options(max_shrink_pct=50, max_changes=1000, backup_dir="")
+        current = [self._dom("d%d.com" % i) for i in range(10)]
+        client = FakeCollClient({"domains": current})
+        with self.assertRaises(hs.SafetyAbort):
+            hs.sync_collection(client, hs.DOMAINS, [], opts, {0: "Default"},
+                               {"Default": 0}, {0: "Default"}, "stamp")
+        self.assertEqual(client.writes, [])
+
+    def test_in_sync_no_writes(self):
+        opts = hs.Options(backup_dir="")
+        items = [self._dom("a.com")]
+        client = FakeCollClient({"domains": items})
+        changed, drifted = hs.sync_collection(client, hs.DOMAINS, items, opts,
+                                              {0: "Default"}, {"Default": 0},
+                                              {0: "Default"}, "stamp")
+        self.assertFalse(changed)
+        self.assertFalse(drifted)
+        self.assertEqual(client.writes, [])
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 # holesync
 
-A small, dependency-free replicator that keeps the **local DNS records** of one
-or more secondary Pi-holes (v6) in lockstep with a primary, using the Pi-hole
-REST API.
+A small, dependency-free replicator that keeps one or more secondary Pi-holes
+(v6) in lockstep with a primary, using the Pi-hole REST API.
 
-It is built for one job and to do it safely: mirror `dns.hosts` and
-`dns.cnameRecords` from a source Pi-hole to its replicas, with **no DNS
-downtime** and strong guards against propagating a bad read.
+Its core job is to mirror **local DNS records** (`dns.hosts` and
+`dns.cnameRecords`) with **no DNS downtime** and strong guards against
+propagating a bad read. It can optionally also mirror the gravity-database
+**groups, adlists, and allow/deny domains** — everything you hand-maintain on
+the primary — using the same validate → back up → write → verify discipline.
 
 ```
 ┌──────────────┐   read /api/config/dns    ┌──────────────┐
@@ -82,10 +83,16 @@ password = your-admin-password
 [sync]
 hosts = true
 cnames = true
+# optional gravity-database collections:
+groups = false
+adlists = false
+domains = false
+run_gravity = false
 
 [safety]
 min_hosts = 5
 max_shrink_pct = 50
+max_changes = 25
 backup_dir = /var/lib/holesync/backups
 backup_keep = 30
 
@@ -94,9 +101,10 @@ file = /var/log/holesync.log
 level = info
 ```
 
-Add as many `[replica:<name>]` sections as you have replicas. Passwords can be
-kept out of the file with `password_file = /path/to/secret` instead of
-`password =`.
+See [`holesync.conf.example`](holesync.conf.example) for every option with
+inline documentation. Add as many `[replica:<name>]` sections as you have
+replicas. Passwords can be kept out of the file with `password_file =
+/path/to/secret` instead of `password =`.
 
 ## Usage
 
@@ -137,16 +145,38 @@ systemctl list-timers holesync.timer
 
 ## What it syncs (and what it deliberately doesn't)
 
-| Data | Synced | Why |
+| Data | Synced | Notes |
 | --- | --- | --- |
-| `dns.hosts` (local A/AAAA records) | ✅ | Hand-maintained on the primary; the thing that actually drifts |
-| `dns.cnameRecords` (local CNAMEs) | ✅ | Same |
-| Blocklist (gravity) domains | ❌ | Each Pi-hole already refreshes the same adlists itself |
-| Adlist / allow / deny *definitions*, groups, clients | ❌ (by design) | Rarely edited; keeping scope small keeps risk low |
+| `dns.hosts` (local A/AAAA records) | ✅ on | Config API — instant in-place reload, **zero DNS downtime** |
+| `dns.cnameRecords` (local CNAMEs) | ✅ on | Same |
+| Filtering **groups** | ☑️ optional | Synced first so adlist/domain group references resolve |
+| **Adlists** (blocklist/allowlist URLs) | ☑️ optional | The list *definitions*; see gravity note below |
+| Allow/deny **domains** (exact + regex) | ☑️ optional | Apply on their own — no gravity rebuild needed |
+| Resolved blocklist (gravity) domains | ❌ | Each Pi-hole already refreshes the same adlists on its own cron |
+| Clients | ❌ | Only meaningful with per-client groups; device-specific, not worth syncing |
 
-Scope is intentionally narrow. If you maintain adlist/allowlist definitions on
-the primary and want those mirrored too, that's a natural future addition built
-on the same validate → back up → write → verify pattern.
+Enable the optional collections in `[sync]`. Groups, adlists, and domains are
+matched by name/value, not by database id — holesync **remaps group references
+by name** so an adlist on "Kids" lands on the replica's "Kids" group even if the
+two Pi-holes assigned that group different ids.
+
+### A note on applying gravity changes
+
+Allow/deny **domains** and **groups** take effect on the replica the moment
+they're written. **Adlist** changes are different: the list of blocked domains
+is only rebuilt by a *gravity* run. holesync leaves `run_gravity = false` by
+default, which means a newly-synced adlist is picked up by the replica's own
+scheduled gravity cron (or your next manual `pihole -g`). Set `run_gravity =
+true` to have holesync rebuild gravity on a replica immediately after its adlists
+change — convenient, but heavier (it downloads and parses every adlist), so it
+only fires when adlists actually changed.
+
+> **On constrained replicas** (e.g. Pi-hole in a container on a NAS), each
+> collection write triggers a list reload that can be slow and IO-heavy. holesync
+> writes one item at a time and waits out each reload, and the `max_changes` guard
+> refuses an oversized bulk apply (restoring a wiped replica) unless you pass
+> `--force`. Steady-state runs are diff-gated and write nothing, so this only
+> matters when there is real drift.
 
 ## How a run works
 
