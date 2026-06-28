@@ -173,11 +173,13 @@ change — convenient, but heavier (it downloads and parses every adlist), so it
 only fires when adlists actually changed.
 
 > **On constrained replicas** (e.g. Pi-hole in a container on a NAS), each
-> collection write triggers a list reload that can be slow and IO-heavy. holesync
-> writes one item at a time and waits out each reload, and the `max_changes` guard
-> refuses an oversized bulk apply (restoring a wiped replica) unless you pass
-> `--force`. Steady-state runs are diff-gated and write nothing, so this only
-> matters when there is real drift.
+> gravity-collection write triggers a list reload that is IO-heavy. holesync
+> batches writes (one `:batchDelete`, grouped array-adds) to minimise reloads,
+> and protects a weak replica with two pre-flights: it **refuses to write** to a
+> replica already reporting a database problem, and **defers** the collection
+> writes when the replica is slow to answer a trivial request (`load_probe_max`).
+> DNS-record sync — which never touches the gravity database — always proceeds.
+> See [DESIGN.md](DESIGN.md) for the full action→follow-up matrix and rationale.
 
 ## How a run works
 

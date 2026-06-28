@@ -276,6 +276,36 @@ class TestPlanCollection(unittest.TestCase):
         self.assertNotIn("Default", names)  # never deleted
 
 
+class TestBatching(unittest.TestCase):
+    def _dom(self, d, comment="", groups=(0,)):
+        return {"type": "allow", "kind": "exact", "domain": d, "enabled": True,
+                "comment": comment, "groups": list(groups)}
+
+    def test_homogeneous_adds_collapse_to_one_post(self):
+        items = [self._dom("a.com"), self._dom("b.com"), self._dom("c.com")]
+        out = hs.bucket_adds(hs.DOMAINS, items, lambda it: [0])
+        self.assertEqual(len(out), 1)                       # one POST for all three
+        path, body = out[0]
+        self.assertEqual(path, "/api/domains/allow/exact")
+        self.assertEqual(sorted(body["domain"]), ["a.com", "b.com", "c.com"])
+        self.assertEqual(body["groups"], [0])
+
+    def test_differing_attrs_split_into_separate_posts(self):
+        items = [self._dom("a.com", comment="x"), self._dom("b.com", comment="y")]
+        out = hs.bucket_adds(hs.DOMAINS, items, lambda it: [0])
+        self.assertEqual(len(out), 2)                       # different comments -> 2 POSTs
+
+    def test_group_remap_applied_in_payload(self):
+        # gids_fn simulates name-based remap: source group ids -> replica ids.
+        items = [self._dom("a.com", groups=[1])]
+        out = hs.bucket_adds(hs.DOMAINS, items, lambda it: [7])
+        self.assertEqual(out[0][1]["groups"], [7])
+
+    def test_delete_keys_carry_type_and_kind(self):
+        key = hs.DOMAINS.delete_key(self._dom("a.com"))
+        self.assertEqual(key, {"item": "a.com", "type": "allow", "kind": "exact"})
+
+
 class FakeCollClient:
     name = "fake"
 
@@ -288,6 +318,10 @@ class FakeCollClient:
 
     def write_item(self, m, p, b):
         self.writes.append((m, p, b))
+        return 200, {}
+
+    def batch_delete(self, kind, keys):
+        self.writes.append(("BATCHDELETE", kind, keys))
         return 200, {}
 
 
@@ -324,6 +358,81 @@ class TestCollectionGuards(unittest.TestCase):
         self.assertFalse(changed)
         self.assertFalse(drifted)
         self.assertEqual(client.writes, [])
+
+
+DOM_ITEM = {"type": "allow", "kind": "exact", "domain": "a.com",
+            "enabled": True, "comment": "", "groups": [0]}
+
+
+class FakeGravityClient:
+    name = "fake"
+
+    def __init__(self, probe_rtt=0.1, messages=None, collections=None):
+        self._probe = probe_rtt
+        self._messages = messages or []
+        self._collections = collections or {}
+        self.calls = []
+
+    def get_messages(self):
+        return list(self._messages)
+
+    def probe(self):
+        return self._probe
+
+    def get_collection(self, kind):
+        self.calls.append(("GET", kind))
+        return list(self._collections.get(kind, []))
+
+    def write_item(self, *a):
+        self.calls.append(("WRITE", a))
+        return 200, {}
+
+    def batch_delete(self, *a):
+        self.calls.append(("DEL", a))
+        return 200, {}
+
+
+class TestPreflight(unittest.TestCase):
+    def _src(self):
+        return hs.SourceState(
+            dns=hs.DnsRecords(),
+            domains=[dict(DOM_ITEM)],
+            group_id2name={0: "Default"},
+        )
+
+    def test_db_health_messages_matches_corruption(self):
+        c = FakeGravityClient(messages=[
+            {"type": "DATABASE", "message": "database disk image is malformed"},
+            {"type": "RATE_LIMIT", "message": "client x rate-limited"},
+        ])
+        hits = hs.db_health_messages(c)
+        self.assertEqual(len(hits), 1)
+
+    def test_unhealthy_replica_refuses_to_write(self):
+        opts = hs.Options(sync_domains=True, backup_dir="")
+        c = FakeGravityClient(messages=[{"type": "DATABASE", "message": "malformed"}])
+        with self.assertRaises(hs.SafetyAbort):
+            hs._sync_gravity(c, self._src(), opts, "stamp", "r1")
+        self.assertEqual(c.calls, [])   # never touched the collections
+
+    def test_busy_replica_defers_writes(self):
+        opts = hs.Options(sync_domains=True, load_probe_max=5.0, backup_dir="")
+        c = FakeGravityClient(probe_rtt=99.0)   # slow == busy
+        changed, drifted = hs._sync_gravity(c, self._src(), opts, "stamp", "r1")
+        self.assertFalse(changed)
+        self.assertEqual(c.calls, [])   # deferred before any collection access
+
+    def test_responsive_replica_proceeds(self):
+        opts = hs.Options(sync_domains=True, load_probe_max=5.0, backup_dir="")
+        # Replica already matches source (groups + the one domain) -> in sync.
+        c = FakeGravityClient(probe_rtt=0.05, collections={
+            "groups": [{"id": 0, "name": "Default"}],
+            "domains": [dict(DOM_ITEM)],
+        })
+        changed, drifted = hs._sync_gravity(c, self._src(), opts, "stamp", "r1")
+        self.assertFalse(changed)
+        self.assertFalse(drifted)                       # responsive + already in sync
+        self.assertIn(("GET", "domains"), c.calls)      # proceeded past the probe
 
 
 if __name__ == "__main__":

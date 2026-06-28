@@ -51,8 +51,11 @@ max_shrink_pct = 50   ; refuse a write that deletes > this % of any collection
                       ; (override for a genuine bulk delete with --force)
 shrink_min = 5        ; ...but always allow removing up to this many items, so
                       ; normal edits to a small collection aren't blocked
-max_changes = 25      ; refuse > this many collection changes in one run; a huge
-                      ; bulk apply is IO-heavy on a replica (override with --force)
+max_changes = 100     ; refuse > this many collection changes in one run (sanity
+                      ; bound on a pathological diff; override with --force)
+load_probe_max = 5    ; if a trivial request to a replica is slower than this many
+                      ; seconds, the replica is busy: defer gravity-collection
+                      ; writes to a later run (DNS-record sync still proceeds)
 backup_dir = /var/lib/holesync/backups   ; replica state is saved here before a write
 backup_keep = 30      ; rotations to retain per replica
 

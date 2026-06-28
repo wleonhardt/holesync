@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 LOG = logging.getLogger("holesync")
 
@@ -106,7 +106,8 @@ class Options:
     min_hosts: int = 1
     max_shrink_pct: float = 50.0       # also caps deletions per gravity collection
     shrink_min: int = 5                # shrink guard ignores removals of <= this many items
-    max_changes: int = 25              # per-collection write cap; over this, abort (use --force)
+    max_changes: int = 100             # per-collection change cap; over this, abort (use --force)
+    load_probe_max: float = 5.0        # if a cheap GET is slower than this, defer collection writes
     backup_dir: str = ""
     backup_keep: int = 30
     dry_run: bool = False
@@ -394,7 +395,7 @@ class PiholeClient:
             raise ApiError("[%s] GET %s -> %s" % (self.name, path, status))
         return list(payload.get(kind) or [])
 
-    def write_item(self, method: str, path: str, body: Optional[dict]) -> tuple[int, dict]:
+    def write_item(self, method: str, path: str, body) -> tuple[int, dict]:
         """A collection mutation. These trigger a synchronous FTL list reload on
         the server, so they can be slow to respond — use the longer write timeout
         and a SINGLE attempt. A slow write often applies server-side even when the
@@ -407,6 +408,31 @@ class PiholeClient:
                                  timeout=self.opts.write_timeout, max_attempts=1)
         except HolesyncError:
             return 0, {}
+
+    def batch_delete(self, kind: str, keys: list) -> None:
+        """Delete many items in one call via /api/<kind>:batchDelete."""
+        self.write_item("POST", "/api/%s:batchDelete" % kind, keys)
+
+    def get_messages(self) -> list:
+        """FTL's diagnostic messages — where it reports DB corruption, regex
+        errors, etc. Used as a replica health signal. Best-effort: returns []."""
+        try:
+            status, payload = self._request("GET", "/api/info/messages")
+            return list(payload.get("messages") or []) if status == 200 else []
+        except HolesyncError:
+            return []
+
+    def probe(self) -> float:
+        """Round-trip seconds for a cheap GET — a load/liveness signal. Returns
+        +inf if it fails or exceeds the probe budget (i.e. the replica is busy)."""
+        budget = self.opts.load_probe_max
+        start = time.monotonic()
+        try:
+            status, _ = self._request("GET", "/api/info/messages",
+                                      timeout=budget, max_attempts=1)
+        except HolesyncError:
+            return float("inf")
+        return (time.monotonic() - start) if status == 200 else float("inf")
 
     def run_gravity(self) -> bool:
         """Trigger a gravity rebuild (downloads/parses adlists). Best-effort:
@@ -429,15 +455,23 @@ def _q(s: str) -> str:
 
 @dataclasses.dataclass
 class Collection:
-    """Adapter describing how to read/compare/write one gravity collection."""
+    """Adapter describing how to read/compare/write one gravity collection.
 
-    kind: str                                   # groups | lists | domains
-    key: "callable"                             # item -> hashable identity
+    Writes are batched: items that share a destination + attributes are created
+    in a single array POST, and deletions go through the `:batchDelete` endpoint
+    — so a whole-collection sync costs a few list-reloads on the replica rather
+    than one per item.
+    """
+
+    kind: str                                   # groups | lists | domains | clients
+    key: "callable"                             # item -> hashable identity (for diffing)
     scalar_fields: tuple                        # compared fields besides the key + groups
     has_groups: bool                            # references groups by id?
-    create_req: "callable"                      # (item, gids) -> (method, path, body)
+    item_field: str                             # the per-item field name in an add payload
+    add_path: "callable"                        # (item) -> POST path for adding it
+    add_attrs: "callable"                       # (item, gids) -> shared attrs (no item_field)
     update_req: "callable"                      # (item, gids) -> (method, path, body)
-    delete_req: "callable"                      # (item) -> (method, path)
+    delete_key: "callable"                      # (item) -> dict for the :batchDelete body
     protect: "callable" = lambda it: False      # never delete these (e.g. Default group)
 
 
@@ -470,13 +504,13 @@ GROUPS = Collection(
     key=lambda it: it["name"],
     scalar_fields=("enabled", "comment"),
     has_groups=False,
-    create_req=lambda it, g: ("POST", "/api/groups",
-                              {"name": it["name"], "comment": it.get("comment") or "",
-                               "enabled": bool(it["enabled"])}),
+    item_field="name",
+    add_path=lambda it: "/api/groups",
+    add_attrs=lambda it, g: {"comment": it.get("comment") or "", "enabled": bool(it["enabled"])},
     update_req=lambda it, g: ("PUT", "/api/groups/" + _q(it["name"]),
                               {"name": it["name"], "comment": it.get("comment") or "",
                                "enabled": bool(it["enabled"])}),
-    delete_req=lambda it: ("DELETE", "/api/groups/" + _q(it["name"])),
+    delete_key=lambda it: {"item": it["name"]},
     protect=lambda it: it.get("name") == "Default" or it.get("id") == 0,
 )
 
@@ -485,13 +519,13 @@ ADLISTS = Collection(
     key=lambda it: (it["type"], it["address"]),
     scalar_fields=("enabled", "comment"),
     has_groups=True,
-    create_req=lambda it, g: ("POST", "/api/lists?type=" + _q(it["type"]),
-                              {"address": it["address"], "comment": it.get("comment") or "",
-                               "enabled": bool(it["enabled"]), "groups": g}),
+    item_field="address",
+    add_path=lambda it: "/api/lists?type=" + _q(it["type"]),
+    add_attrs=lambda it, g: {"comment": it.get("comment") or "", "enabled": bool(it["enabled"]), "groups": g},
     update_req=lambda it, g: ("PUT", "/api/lists/" + _q(it["address"]) + "?type=" + _q(it["type"]),
                               {"comment": it.get("comment") or "",
                                "enabled": bool(it["enabled"]), "groups": g}),
-    delete_req=lambda it: ("DELETE", "/api/lists/" + _q(it["address"]) + "?type=" + _q(it["type"])),
+    delete_key=lambda it: {"item": it["address"], "type": it["type"]},
 )
 
 DOMAINS = Collection(
@@ -499,13 +533,13 @@ DOMAINS = Collection(
     key=lambda it: (it["type"], it["kind"], it["domain"]),
     scalar_fields=("enabled", "comment"),
     has_groups=True,
-    create_req=lambda it, g: ("POST", "/api/domains/%s/%s" % (_q(it["type"]), _q(it["kind"])),
-                              {"domain": it["domain"], "comment": it.get("comment") or "",
-                               "enabled": bool(it["enabled"]), "groups": g}),
+    item_field="domain",
+    add_path=lambda it: "/api/domains/%s/%s" % (_q(it["type"]), _q(it["kind"])),
+    add_attrs=lambda it, g: {"comment": it.get("comment") or "", "enabled": bool(it["enabled"]), "groups": g},
     update_req=lambda it, g: ("PUT", "/api/domains/%s/%s/%s" % (_q(it["type"]), _q(it["kind"]), _q(it["domain"])),
                               {"comment": it.get("comment") or "",
                                "enabled": bool(it["enabled"]), "groups": g}),
-    delete_req=lambda it: ("DELETE", "/api/domains/%s/%s/%s" % (_q(it["type"]), _q(it["kind"]), _q(it["domain"]))),
+    delete_key=lambda it: {"item": it["domain"], "type": it["type"], "kind": it["kind"]},
 )
 
 CLIENTS = Collection(
@@ -513,13 +547,27 @@ CLIENTS = Collection(
     key=lambda it: it["client"],          # an IP, MAC, hostname, or subnet
     scalar_fields=("comment",),           # clients have no 'enabled' field
     has_groups=True,
-    create_req=lambda it, g: ("POST", "/api/clients",
-                              {"client": it["client"], "comment": it.get("comment") or "",
-                               "groups": g}),
+    item_field="client",
+    add_path=lambda it: "/api/clients",
+    add_attrs=lambda it, g: {"comment": it.get("comment") or "", "groups": g},
     update_req=lambda it, g: ("PUT", "/api/clients/" + _q(it["client"]),
                               {"comment": it.get("comment") or "", "groups": g}),
-    delete_req=lambda it: ("DELETE", "/api/clients/" + _q(it["client"])),
+    delete_key=lambda it: {"item": it["client"]},
 )
+
+
+def bucket_adds(coll: Collection, items: list[dict], gids_fn) -> list:
+    """Group items to add into the fewest array-POSTs: items sharing a path and
+    attributes (comment/enabled/groups) ride in one request. Returns a list of
+    (path, body) where body carries the item_field as an array."""
+    buckets: dict = {}
+    for it in items:
+        attrs = coll.add_attrs(it, gids_fn(it))
+        path = coll.add_path(it)
+        sig = (path, json.dumps(attrs, sort_keys=True))
+        buckets.setdefault(sig, (path, attrs, []))[2].append(it[coll.item_field])
+    return [(path, {**attrs, coll.item_field: vals})
+            for path, attrs, vals in buckets.values()]
 
 
 def plan_collection(coll: Collection, source: list[dict], current: list[dict],
@@ -564,15 +612,13 @@ def sync_collection(client: "PiholeClient", coll: Collection, source: list[dict]
                 "%s: would delete %d of %d items (> %.0f%%) — refusing without --force"
                 % (coll.kind, len(to_delete), len(current), opts.max_shrink_pct)
             )
-    # Change cap — a single write triggers a gravity reload on the replica, which
-    # is IO-heavy on constrained hardware. Refuse to flood it with a huge bulk
-    # apply (e.g. restoring a wiped replica); the operator can --force or rebuild
-    # the replica's gravity database directly instead.
+    # Change cap — a sanity bound on how much one run will rewrite. Writes are
+    # batched (few reloads even for many items), so this is mostly a guard against
+    # a pathological diff, not an IO limit. Override a legitimate bulk with --force.
     total_changes = len(to_add) + len(to_update) + len(to_delete)
     if not opts.force and total_changes > opts.max_changes:
         raise SafetyAbort(
-            "%s: %d changes exceed max_changes=%d — refusing without --force "
-            "(a large bulk apply is IO-heavy on the replica)"
+            "%s: %d changes exceed max_changes=%d — refusing without --force"
             % (coll.kind, total_changes, opts.max_changes)
         )
 
@@ -588,16 +634,20 @@ def sync_collection(client: "PiholeClient", coll: Collection, source: list[dict]
     if opts.backup_dir:
         _backup_collection(client.name, coll.kind, current, opts, stamp)
 
+    def gids(it):
+        return _translate_groups(it, src_id2name, dst_name2id) if coll.has_groups else []
+
     def apply(items_add, items_upd, items_del):
-        for it in items_add:
-            m, p, b = coll.create_req(it, _translate_groups(it, src_id2name, dst_name2id))
-            client.write_item(m, p, b)
+        # Deletes: one :batchDelete call for the whole collection.
+        if items_del:
+            client.batch_delete(coll.kind, [coll.delete_key(it) for it in items_del])
+        # Adds: one array POST per shared-attribute group (one reload, not N).
+        for path, body in bucket_adds(coll, items_add, gids):
+            client.write_item("POST", path, body)
+        # Updates change attributes per item, so they stay individual (rare).
         for it in items_upd:
-            m, p, b = coll.update_req(it, _translate_groups(it, src_id2name, dst_name2id))
+            m, p, b = coll.update_req(it, gids(it))
             client.write_item(m, p, b)
-        for it in items_del:
-            m, p = coll.delete_req(it)
-            client.write_item(m, p, None)
 
     apply(to_add, to_update, to_delete)
 
@@ -622,6 +672,26 @@ def group_maps(items: list[dict]) -> tuple[dict, dict]:
     id2name = {it["id"]: it["name"] for it in items if "id" in it}
     name2id = {it["name"]: it["id"] for it in items if "id" in it}
     return id2name, name2id
+
+
+_DB_TROUBLE = ("malformed", "corrupt", "disk image", "database is locked",
+               "no such table", "database error")
+
+
+def db_health_messages(client: "PiholeClient") -> list:
+    """FTL diagnostic messages that indicate a gravity-database problem.
+
+    The gravity collections all live in gravity.db; before writing to a replica
+    we check it isn't already reporting corruption, and after writing we check we
+    didn't introduce one. Matches on message type or text so it stays robust
+    across FTL versions."""
+    out = []
+    for m in client.get_messages():
+        typ = str(m.get("type", "")).upper()
+        text = str(m.get("message", "")).lower()
+        if "DATABASE" in typ or "GRAVITY" in typ or any(w in text for w in _DB_TROUBLE):
+            out.append(m)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -759,6 +829,27 @@ def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
     Triggers a gravity rebuild only when adlists actually changed."""
     changed = drifted = False
 
+    # Pre-flight: never write into a replica whose gravity database is already
+    # reporting trouble — that is how a bad state gets amplified.
+    pre = db_health_messages(client)
+    if pre and not opts.dry_run and not opts.force:
+        raise SafetyAbort(
+            "replica reports a gravity-database problem (%s) — refusing to write "
+            "(repair the replica, or pass --force): %r"
+            % (len(pre), pre[0].get("message")))
+
+    # Load pre-flight: each collection write triggers a list reload that is
+    # IO-heavy on constrained replicas. If the replica is already slow to answer
+    # a trivial request, DON'T pile writes onto it — defer to a later run when it
+    # is idle. (DNS-record sync, which is light, has already run.)
+    if not opts.dry_run and not opts.force:
+        rtt = client.probe()
+        if rtt > opts.load_probe_max:
+            LOG.warning("[%s] replica slow to respond (%.1fs > %.1fs) — deferring "
+                        "gravity-collection writes to a later run",
+                        name, rtt, opts.load_probe_max)
+            return False, False
+
     # Groups first so adlist/domain group references resolve on the replica.
     if opts.sync_groups:
         ch, dr = sync_collection(client, GROUPS, source.groups, opts,
@@ -791,6 +882,15 @@ def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
         ok = client.run_gravity()
         LOG.info("[%s] gravity rebuild %s", name,
                  "ok" if ok else "did not confirm (continues server-side)")
+
+    # Post-flight: if we wrote and a NEW database problem appeared, fail loudly —
+    # it points at a write that the replica could not digest cleanly.
+    if changed and not opts.dry_run:
+        new = [m for m in db_health_messages(client) if m not in pre]
+        if new:
+            raise ApiError(
+                "[%s] replica reported a database problem after sync (%s) — "
+                "check gravity.db health" % (name, new[0].get("message")))
 
     if not drifted:
         LOG.info("[%s] gravity collections already in sync "
@@ -893,7 +993,8 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
         min_hosts=gi(sf, "min_hosts", 1),
         max_shrink_pct=gf(sf, "max_shrink_pct", 50.0),
         shrink_min=gi(sf, "shrink_min", 5),
-        max_changes=gi(sf, "max_changes", 25),
+        max_changes=gi(sf, "max_changes", 100),
+        load_probe_max=gf(sf, "load_probe_max", 5.0),
         backup_dir=os.path.expanduser(sf.get("backup_dir", "") if sf else ""),
         backup_keep=gi(sf, "backup_keep", 30),
     )
