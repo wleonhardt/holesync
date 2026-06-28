@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 LOG = logging.getLogger("holesync")
 
@@ -91,6 +91,7 @@ class Options:
     sync_groups: bool = False
     sync_adlists: bool = False
     sync_domains: bool = False
+    sync_clients: bool = False
     # Trigger a gravity rebuild on a replica when its adlists change. OFF by
     # default: a rebuild is heavy and only adlist *content* needs it (allow/deny
     # domains and groups apply instantly without it). Leave off to let the
@@ -104,6 +105,7 @@ class Options:
     verify_tls: bool = True
     min_hosts: int = 1
     max_shrink_pct: float = 50.0       # also caps deletions per gravity collection
+    shrink_min: int = 5                # shrink guard ignores removals of <= this many items
     max_changes: int = 25              # per-collection write cap; over this, abort (use --force)
     backup_dir: str = ""
     backup_keep: int = 30
@@ -113,7 +115,8 @@ class Options:
     @property
     def sync_gravity(self) -> bool:
         """True if any gravity-database collection is enabled."""
-        return self.sync_groups or self.sync_adlists or self.sync_domains
+        return (self.sync_groups or self.sync_adlists
+                or self.sync_domains or self.sync_clients)
 
 
 class HolesyncError(Exception):
@@ -222,24 +225,26 @@ def shrink_guard(src: DnsRecords, dst: DnsRecords, opts: Options) -> None:
     If the source suddenly reports far fewer records than the replica currently
     has, that is far more likely to be a source-side glitch than a real bulk
     deletion. Abort rather than propagate the loss. Override with --force.
+
+    Removals of up to ``shrink_min`` records are always allowed — the guard
+    targets mass-deletion, not ordinary edits to a small record set.
     """
     if opts.force:
         return
     threshold = 1.0 - (opts.max_shrink_pct / 100.0)
-    if opts.sync_hosts and len(dst.hosts) > 0:
-        if len(src.hosts) < len(dst.hosts) * threshold:
+
+    def check(label: str, src_n: int, dst_n: int) -> None:
+        drop = dst_n - src_n
+        if drop > opts.shrink_min and src_n < dst_n * threshold:
             raise SafetyAbort(
-                "host records would drop %d -> %d (> %.0f%% shrink) — "
-                "refusing without --force"
-                % (len(dst.hosts), len(src.hosts), opts.max_shrink_pct)
+                "%s would drop %d -> %d (> %.0f%% shrink) — refusing without --force"
+                % (label, dst_n, src_n, opts.max_shrink_pct)
             )
-    if opts.sync_cnames and len(dst.cnames) > 0:
-        if len(src.cnames) < len(dst.cnames) * threshold:
-            raise SafetyAbort(
-                "cname records would drop %d -> %d (> %.0f%% shrink) — "
-                "refusing without --force"
-                % (len(dst.cnames), len(src.cnames), opts.max_shrink_pct)
-            )
+
+    if opts.sync_hosts:
+        check("host records", len(src.hosts), len(dst.hosts))
+    if opts.sync_cnames:
+        check("cname records", len(src.cnames), len(dst.cnames))
 
 
 # --------------------------------------------------------------------------- #
@@ -383,7 +388,7 @@ class PiholeClient:
         write, and the replica may still be holding its database lock during the
         post-write list reload — the GET must wait that out rather than fail."""
         path = {"groups": "/api/groups", "lists": "/api/lists",
-                "domains": "/api/domains"}[kind]
+                "domains": "/api/domains", "clients": "/api/clients"}[kind]
         status, payload = self._request("GET", path, timeout=self.opts.write_timeout)
         if status != 200:
             raise ApiError("[%s] GET %s -> %s" % (self.name, path, status))
@@ -503,6 +508,19 @@ DOMAINS = Collection(
     delete_req=lambda it: ("DELETE", "/api/domains/%s/%s/%s" % (_q(it["type"]), _q(it["kind"]), _q(it["domain"]))),
 )
 
+CLIENTS = Collection(
+    kind="clients",
+    key=lambda it: it["client"],          # an IP, MAC, hostname, or subnet
+    scalar_fields=("comment",),           # clients have no 'enabled' field
+    has_groups=True,
+    create_req=lambda it, g: ("POST", "/api/clients",
+                              {"client": it["client"], "comment": it.get("comment") or "",
+                               "groups": g}),
+    update_req=lambda it, g: ("PUT", "/api/clients/" + _q(it["client"]),
+                              {"comment": it.get("comment") or "", "groups": g}),
+    delete_req=lambda it: ("DELETE", "/api/clients/" + _q(it["client"])),
+)
+
 
 def plan_collection(coll: Collection, source: list[dict], current: list[dict],
                     src_id2name: dict, dst_id2name: dict):
@@ -537,8 +555,11 @@ def sync_collection(client: "PiholeClient", coll: Collection, source: list[dict]
         return False, False
 
     # Delete/shrink guard — a source glitch must not mass-delete a replica.
+    # Removals of up to shrink_min items are always allowed (normal edits to a
+    # small collection); the guard targets mass-deletion of a large one.
     if not opts.force and len(current) > 0:
-        if len(to_delete) > len(current) * (opts.max_shrink_pct / 100.0):
+        if (len(to_delete) > opts.shrink_min
+                and len(to_delete) > len(current) * (opts.max_shrink_pct / 100.0)):
             raise SafetyAbort(
                 "%s: would delete %d of %d items (> %.0f%%) — refusing without --force"
                 % (coll.kind, len(to_delete), len(current), opts.max_shrink_pct)
@@ -664,6 +685,7 @@ class SourceState:
     groups: list = dataclasses.field(default_factory=list)
     lists: list = dataclasses.field(default_factory=list)
     domains: list = dataclasses.field(default_factory=list)
+    clients: list = dataclasses.field(default_factory=list)
     group_id2name: dict = dataclasses.field(default_factory=dict)
 
 
@@ -686,6 +708,10 @@ def validate_source_collections(source: SourceState, opts: Options) -> None:
                 raise SafetyAbort(
                     "source domain invalid: %r"
                     % {k: it.get(k) for k in ("domain", "type", "kind")})
+    if opts.sync_clients:
+        for it in source.clients:
+            if not it.get("client"):
+                raise SafetyAbort("source client missing identifier: %r" % it)
 
 
 def _sync_dns_records(client: "PiholeClient", source: DnsRecords, opts: Options,
@@ -754,6 +780,11 @@ def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
                                  source.group_id2name, dst_name2id, dst_id2name, stamp)
         changed |= ch
         drifted |= dr
+    if opts.sync_clients:
+        ch, dr = sync_collection(client, CLIENTS, source.clients, opts,
+                                 source.group_id2name, dst_name2id, dst_id2name, stamp)
+        changed |= ch
+        drifted |= dr
 
     if adlists_changed and opts.run_gravity and not opts.dry_run:
         LOG.info("[%s] adlists changed — rebuilding gravity", name)
@@ -762,9 +793,10 @@ def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
                  "ok" if ok else "did not confirm (continues server-side)")
 
     if not drifted:
-        ng, nl, nd = len(source.groups), len(source.lists), len(source.domains)
-        LOG.info("[%s] gravity collections already in sync (%d groups, %d lists, %d domains)",
-                 name, ng, nl, nd)
+        LOG.info("[%s] gravity collections already in sync "
+                 "(%d groups, %d lists, %d domains, %d clients)", name,
+                 len(source.groups), len(source.lists),
+                 len(source.domains), len(source.clients))
     return changed, drifted
 
 
@@ -851,6 +883,7 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
         sync_groups=gb(sy, "groups", False),
         sync_adlists=gb(sy, "adlists", False),
         sync_domains=gb(sy, "domains", False),
+        sync_clients=gb(sy, "clients", False),
         run_gravity=gb(sy, "run_gravity", True),
         timeout=gf(sy, "timeout", 8.0),
         write_timeout=gf(sy, "write_timeout", 30.0),
@@ -859,13 +892,14 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
         verify_tls=gb(sy, "verify_tls", True),
         min_hosts=gi(sf, "min_hosts", 1),
         max_shrink_pct=gf(sf, "max_shrink_pct", 50.0),
+        shrink_min=gi(sf, "shrink_min", 5),
         max_changes=gi(sf, "max_changes", 25),
         backup_dir=os.path.expanduser(sf.get("backup_dir", "") if sf else ""),
         backup_keep=gi(sf, "backup_keep", 30),
     )
-    # Adlists/domains reference groups; syncing them without groups risks
-    # dangling references. Pull groups along automatically.
-    if (opts.sync_adlists or opts.sync_domains) and not opts.sync_groups:
+    # Adlists/domains/clients reference groups; syncing them without groups
+    # risks dangling references. Pull groups along automatically.
+    if (opts.sync_adlists or opts.sync_domains or opts.sync_clients) and not opts.sync_groups:
         opts.sync_groups = True
     logcfg = dict(cp["log"]) if cp.has_section("log") else {}
     return src, replicas, opts, logcfg
@@ -948,9 +982,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 source.lists = sc.get_collection("lists")
             if opts.sync_domains:
                 source.domains = sc.get_collection("domains")
+            if opts.sync_clients:
+                source.clients = sc.get_collection("clients")
         sh, scn = source.dns.counts()
-        LOG.info("source: %d hosts, %d cnames, %d groups, %d adlists, %d domains",
-                 sh, scn, len(source.groups), len(source.lists), len(source.domains))
+        LOG.info("source: %d hosts, %d cnames, %d groups, %d adlists, %d domains, %d clients",
+                 sh, scn, len(source.groups), len(source.lists),
+                 len(source.domains), len(source.clients))
         validate_source(source.dns, opts)
         validate_source_collections(source, opts)
 

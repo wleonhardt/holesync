@@ -92,6 +92,16 @@ class TestShrinkGuard(unittest.TestCase):
         dst = hs.DnsRecords(hosts=["10.0.0.1 a", "10.0.0.2 b"])
         hs.shrink_guard(src, dst, opts)  # must not raise
 
+    def test_small_removals_allowed_despite_pct(self):
+        # Removing a couple of records from a small set is a normal edit, not a
+        # glitch — even though it exceeds the percentage, it's under shrink_min.
+        opts = hs.Options(max_shrink_pct=50, shrink_min=5)
+        hs.shrink_guard(hs.DnsRecords(hosts=[]),
+                        hs.DnsRecords(hosts=["10.0.0.1 a"]), opts)        # 1 -> 0
+        hs.shrink_guard(hs.DnsRecords(hosts=["10.0.0.1 a"]),
+                        hs.DnsRecords(hosts=["10.0.0.%d h" % i for i in range(4)]),
+                        opts)  # 4 -> 1, drop 3 <= shrink_min: allowed
+
 
 class FakeClient:
     """Stand-in for PiholeClient that records writes against in-memory state."""
@@ -242,6 +252,19 @@ class TestPlanCollection(unittest.TestCase):
               "comment": "", "groups": [0]}]
         add, upd, dele = hs.plan_collection(hs.DOMAINS, s, c, src_id2name, dst_id2name)
         self.assertEqual(len(upd), 1)
+
+    def test_clients_plan_with_group_remap(self):
+        # Clients reference groups by id; compare by group NAME across Pi-holes.
+        src_id2name = {0: "Default", 1: "Kids"}
+        dst_id2name = {0: "Default", 6: "Kids"}
+        s = [{"client": "10.0.0.5", "comment": "tv", "groups": [1]},
+             {"client": "aa:bb:cc:dd:ee:ff", "comment": "", "groups": [0]}]
+        c = [{"client": "10.0.0.5", "comment": "tv", "groups": [6]},   # same (Kids on both)
+             {"client": "10.0.0.9", "comment": "old", "groups": [0]}]  # not in source
+        add, upd, dele = hs.plan_collection(hs.CLIENTS, s, c, src_id2name, dst_id2name)
+        self.assertEqual([x["client"] for x in add], ["aa:bb:cc:dd:ee:ff"])
+        self.assertEqual([x["client"] for x in dele], ["10.0.0.9"])
+        self.assertEqual(upd, [])  # 10.0.0.5 matches once groups are name-mapped
 
     def test_default_group_protected_from_delete(self):
         source = []  # source has no groups

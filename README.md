@@ -87,6 +87,7 @@ cnames = true
 groups = false
 adlists = false
 domains = false
+clients = false
 run_gravity = false
 
 [safety]
@@ -152,13 +153,13 @@ systemctl list-timers holesync.timer
 | Filtering **groups** | ☑️ optional | Synced first so adlist/domain group references resolve |
 | **Adlists** (blocklist/allowlist URLs) | ☑️ optional | The list *definitions*; see gravity note below |
 | Allow/deny **domains** (exact + regex) | ☑️ optional | Apply on their own — no gravity rebuild needed |
+| **Clients** (per-client group assignments) | ☑️ optional | Identified by IP/MAC/hostname/subnet; only useful alongside groups |
 | Resolved blocklist (gravity) domains | ❌ | Each Pi-hole already refreshes the same adlists on its own cron |
-| Clients | ❌ | Only meaningful with per-client groups; device-specific, not worth syncing |
 
-Enable the optional collections in `[sync]`. Groups, adlists, and domains are
-matched by name/value, not by database id — holesync **remaps group references
-by name** so an adlist on "Kids" lands on the replica's "Kids" group even if the
-two Pi-holes assigned that group different ids.
+Enable the optional collections in `[sync]`. Groups, adlists, domains, and
+clients are matched by name/value, not by database id — holesync **remaps group
+references by name** so an item on "Kids" lands on the replica's "Kids" group
+even if the two Pi-holes assigned that group different ids.
 
 ### A note on applying gravity changes
 

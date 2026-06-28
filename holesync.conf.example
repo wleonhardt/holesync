@@ -29,6 +29,7 @@ cnames = true         ; local CNAMEs (dns.cnameRecords)
 groups = false        ; filtering groups
 adlists = false       ; blocklist/allowlist URLs (the adlist definitions)
 domains = false       ; allow/deny exact+regex domains (auto-apply, no rebuild)
+clients = false       ; per-client group assignments (only useful with groups)
 
 # A gravity rebuild is only needed to apply changed ADLIST *content*; allow/deny
 # domains and groups apply on their own. Leave off to let the replica's own
@@ -48,6 +49,8 @@ verify_tls = true     ; set false only for self-signed https Pi-holes
 min_hosts = 1         ; refuse to sync if the source reports fewer host records
 max_shrink_pct = 50   ; refuse a write that deletes > this % of any collection
                       ; (override for a genuine bulk delete with --force)
+shrink_min = 5        ; ...but always allow removing up to this many items, so
+                      ; normal edits to a small collection aren't blocked
 max_changes = 25      ; refuse > this many collection changes in one run; a huge
                       ; bulk apply is IO-heavy on a replica (override with --force)
 backup_dir = /var/lib/holesync/backups   ; replica state is saved here before a write
