@@ -354,6 +354,152 @@ class TestReplicaIsolation(unittest.TestCase):
         self.assertEqual(res.code, 1)
 
 
+class TestConfigErrorPaths(unittest.TestCase):
+    def _write(self, text):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False)
+        fh.write(text)
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    _MIN = ("[source]\nurl = http://x\npassword = pw\n\n"
+            "[replica:r1]\nurl = http://y\npassword = pw\n")
+
+    def test_missing_password_file_is_config_error(self):
+        # P1: must be a clean HolesyncError (exit 2), not an OSError traceback.
+        path = self._write(self._MIN.replace(
+            "password = pw", "password_file = /nonexistent/pw", 1))
+        with self.assertRaises(hs.HolesyncError) as cm:
+            hs.load_config(path)
+        self.assertIn("password_file", str(cm.exception))
+
+    def test_unreadable_config_reports_real_cause(self):
+        # P2: a permissions error must not surface as "missing [source]".
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        path = self._write(self._MIN)
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o600)
+        with self.assertRaises(hs.HolesyncError) as cm:
+            hs.load_config(path)
+        self.assertIn("cannot read", str(cm.exception))
+
+    def test_empty_replica_name_rejected(self):
+        # P3: [replica:] must not produce a nameless replica.
+        path = self._write(self._MIN.replace("replica:r1", "replica:"))
+        with self.assertRaises(hs.HolesyncError):
+            hs.load_config(path)
+
+
+class TestRequestRetries(unittest.TestCase):
+    """T2: _request retry decisions, with a scripted _raw and no real sleeping."""
+
+    def _client(self, script, retries=3):
+        c = hs.PiholeClient.__new__(hs.PiholeClient)
+        c.name = "r1"
+        c.opts = hs.Options(retries=retries)
+        c.sid = c.csrf = c._ctx = None
+        calls = []
+
+        def raw(method, path, body, timeout):
+            calls.append(path)
+            step = script[min(len(calls) - 1, len(script) - 1)]
+            if isinstance(step, Exception):
+                raise step
+            return step
+        c._raw = raw
+        self._orig_sleep = hs.time.sleep
+        hs.time.sleep = lambda s: None
+        self.addCleanup(lambda: setattr(hs.time, "sleep", self._orig_sleep))
+        return c, calls
+
+    def test_500_retries_then_succeeds(self):
+        c, calls = self._client([(500, b""), (200, b'{"ok": true}')])
+        status, payload = c._request("GET", "/api/x")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(calls), 2)
+
+    def test_4xx_is_not_retried(self):
+        c, calls = self._client([(400, b'{"error": {}}')])
+        status, _ = c._request("GET", "/api/x")
+        self.assertEqual(status, 400)
+        self.assertEqual(len(calls), 1)
+
+    def test_conn_error_exhausts_then_raises(self):
+        import urllib.error
+        c, calls = self._client([urllib.error.URLError("refused")])
+        with self.assertRaises(hs.ApiError):
+            c._request("GET", "/api/x")
+        self.assertEqual(len(calls), 3)          # retries=3 attempts
+
+    def test_429_retried(self):
+        c, calls = self._client([(429, b""), (200, b"{}")])
+        status, _ = c._request("GET", "/api/x")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(calls), 2)
+
+
+class TestMainEndToEnd(unittest.TestCase):
+    """T1: exit codes through the real CLI path with a faked PiholeClient."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        import logging
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        self.addCleanup(lambda: __import__("importlib").reload(hs))
+
+    def _config(self):
+        path = os.path.join(self.dir, "t.conf")
+        with open(path, "w") as fh:
+            fh.write("[source]\nurl = http://s\npassword = p\n\n"
+                     "[replica:r1]\nurl = http://r\npassword = p\n\n"
+                     "[log]\nlockfile = %s\n" % os.path.join(self.dir, "t.lock"))
+        return path
+
+    def _fake_factory(self, source_hosts, replica_hosts):
+        # First construction is the source, later ones the replica.
+        states = [hs.DnsRecords(hosts=list(source_hosts))]
+
+        def factory(*a, **k):
+            state = states.pop(0) if states else hs.DnsRecords(hosts=list(replica_hosts))
+            return FakeClient(state)
+        return factory
+
+    def test_exit_0_when_in_sync(self):
+        hs.PiholeClient = self._fake_factory(["10.0.0.1 a"] * 1, ["10.0.0.1 a"])  # type: ignore
+        self.assertEqual(hs.main(["-c", self._config()]), 0)
+
+    def test_exit_10_on_check_drift(self):
+        hs.PiholeClient = self._fake_factory(["10.0.0.1 a", "10.0.0.2 b"], ["10.0.0.1 a"])  # type: ignore
+        self.assertEqual(hs.main(["-c", self._config(), "--check"]), 10)
+
+    def test_exit_2_on_bad_config(self):
+        self.assertEqual(hs.main(["-c", os.path.join(self.dir, "missing.conf")]), 2)
+
+    def test_exit_1_on_malformed_source_item(self):
+        # P4: a source-side KeyError must exit 1, not escape as a traceback.
+        class BadSource:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def get_dns_records(self): raise KeyError("name")
+        hs.PiholeClient = lambda *a, **k: BadSource()  # type: ignore
+        self.assertEqual(hs.main(["-c", self._config()]), 1)
+
+
+class TestDefaultLockPath(unittest.TestCase):
+    def test_nonroot_default_is_writable_dir(self):
+        # P6: unprivileged runs must not default to /run (permission noise).
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        p = hs.default_lock_path()
+        self.assertFalse(p.startswith("/run/"))
+        self.assertTrue(os.access(os.path.dirname(p), os.W_OK))
+
+
 class TestWriteItemLogging(unittest.TestCase):
     def _client(self, status, payload):
         c = hs.PiholeClient.__new__(hs.PiholeClient)

@@ -53,7 +53,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 LOG = logging.getLogger("holesync")
 
@@ -345,7 +345,10 @@ class PiholeClient:
         if not self.sid:
             return
         try:
-            self._request("DELETE", "/api/auth")
+            # Single attempt: logout is best-effort (the session expires on its
+            # own) and retrying against a server that just died only adds
+            # seconds of backoff to an already-failing run.
+            self._request("DELETE", "/api/auth", max_attempts=1)
         except HolesyncError:
             pass
         finally:
@@ -967,8 +970,11 @@ def process_replica(rcfg: ReplicaConfig, source: SourceState, opts: Options, sta
 # --------------------------------------------------------------------------- #
 def _read_password(section: configparser.SectionProxy, ctx: str) -> str:
     if section.get("password_file"):
-        with open(os.path.expanduser(section["password_file"])) as fh:
-            return fh.read().strip()
+        try:
+            with open(os.path.expanduser(section["password_file"])) as fh:
+                return fh.read().strip()
+        except OSError as e:
+            raise HolesyncError("%s: cannot read password_file: %s" % (ctx, e))
     pw = section.get("password", "")
     if not pw:
         raise HolesyncError("%s: no password or password_file set" % ctx)
@@ -983,8 +989,13 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
     # holesync.conf.example (default ConfigParser would fold them into the value).
     cp = configparser.ConfigParser(
         interpolation=None, inline_comment_prefixes=(";", "#"))
+    # read_file, not read(): read() silently ignores unreadable files, which
+    # turns a permissions problem into a baffling "missing [source]" error.
     try:
-        cp.read(path)
+        with open(path) as fh:
+            cp.read_file(fh)
+    except OSError as e:
+        raise HolesyncError("cannot read %s: %s" % (path, e))
     except configparser.Error as e:
         raise HolesyncError("cannot parse %s: %s" % (path, e))
 
@@ -1009,6 +1020,8 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
             continue
         if sect.startswith("replica:") or sect.startswith("replica."):
             name = sect[len("replica:"):]  # strip prefix once; keep dots in name
+            if not name:
+                raise HolesyncError("[%s]: replica name must not be empty" % sect)
             replicas.append(ReplicaConfig(
                 name=name,
                 url=require_url(sect),
@@ -1083,6 +1096,16 @@ def setup_logging(logcfg: dict, verbose: bool) -> None:
     )
 
 
+def default_lock_path() -> str:
+    """Root gets /run/holesync (matches the systemd unit's RuntimeDirectory=);
+    unprivileged runs get a per-user runtime dir they can actually write, so the
+    default never triggers the noisy permission-fallback in acquire_lock."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return "/run/holesync/holesync.lock"
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return os.path.join(base, "holesync.lock")
+
+
 def acquire_lock(path: str):
     """Take an exclusive advisory lock. Returns the open handle, or None if
     another run already holds it. Opens without truncating (so a failed attempt
@@ -1138,7 +1161,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Default outside /tmp: systemd PrivateTmp=true gives the unit a private
     # /tmp, so a /tmp lock can't exclude a manual CLI run. /run/holesync is
     # created by the unit's RuntimeDirectory= (and by acquire_lock otherwise).
-    lock_path = logcfg.get("lockfile", "/run/holesync/holesync.lock")
+    lock_path = logcfg.get("lockfile") or default_lock_path()
     lock = acquire_lock(lock_path)
     if lock is None:
         LOG.warning("another holesync run holds %s — exiting", lock_path)
@@ -1171,6 +1194,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         results = [process_replica(r, source, opts, stamp) for r in replicas]
     except HolesyncError as e:
         LOG.error("%s", e)
+        return 1
+    except Exception:  # noqa: BLE001 — e.g. a malformed SOURCE-side item
+        # (replica-side garbage is isolated in process_replica, but the source
+        # read happens here). Keep the exit-code contract instead of a traceback.
+        LOG.exception("unexpected error")
         return 1
     finally:
         # Closing the fd releases the flock. Deliberately do NOT unlink the
