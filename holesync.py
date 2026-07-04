@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 LOG = logging.getLogger("holesync")
 
@@ -900,6 +900,18 @@ def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
     return changed, drifted
 
 
+def check_exit_code(results: list) -> int:
+    """Exit code for --check mode. A replica that could not be evaluated
+    (unreachable, auth failure, guard abort) DOMINATES a plain drift result:
+    reporting "in sync" when a replica never answered would defeat the check."""
+    failures = [r for r in results if not r.ok]
+    if failures:
+        return max(r.code for r in failures)
+    if any(not r.in_sync for r in results):
+        return 10
+    return 0
+
+
 def process_replica(rcfg: ReplicaConfig, source: SourceState, opts: Options, stamp: str) -> Result:
     try:
         client = PiholeClient(rcfg.name, rcfg.url, rcfg.password, opts)
@@ -940,28 +952,46 @@ def _read_password(section: configparser.SectionProxy, ctx: str) -> str:
 def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options, dict]:
     if not os.path.exists(path):
         raise HolesyncError("config file not found: %s" % path)
-    cp = configparser.ConfigParser()
-    cp.read(path)
+    # interpolation=None: passwords may contain a literal '%'.
+    # inline_comment_prefixes: allow the ';'/'#' inline comments used throughout
+    # holesync.conf.example (default ConfigParser would fold them into the value).
+    cp = configparser.ConfigParser(
+        interpolation=None, inline_comment_prefixes=(";", "#"))
+    try:
+        cp.read(path)
+    except configparser.Error as e:
+        raise HolesyncError("cannot parse %s: %s" % (path, e))
+
+    def require_url(sect: str) -> str:
+        try:
+            return cp[sect]["url"]
+        except KeyError:
+            raise HolesyncError("[%s]: missing required 'url'" % sect)
 
     if not cp.has_section("source"):
         raise HolesyncError("config missing [source] section")
     src = ReplicaConfig(
         name="source",
-        url=cp["source"]["url"],
+        url=require_url("source"),
         password=_read_password(cp["source"], "[source]"),
     )
 
+    known = {"source", "sync", "safety", "log"}
     replicas: list[ReplicaConfig] = []
     for sect in cp.sections():
-        if sect == "source" or sect.startswith("replica:") or sect.startswith("replica."):
-            if sect == "source":
-                continue
-            name = sect.split(":", 1)[-1].split(".", 1)[-1]
+        if sect in known:
+            continue
+        if sect.startswith("replica:") or sect.startswith("replica."):
+            name = sect[len("replica:"):]  # strip prefix once; keep dots in name
             replicas.append(ReplicaConfig(
                 name=name,
-                url=cp[sect]["url"],
+                url=require_url(sect),
                 password=_read_password(cp[sect], "[%s]" % sect),
             ))
+        else:
+            raise HolesyncError(
+                "unrecognized config section [%s] (expected [source], [sync], "
+                "[safety], [log], or [replica:<name>])" % sect)
     if not replicas:
         raise HolesyncError("config defines no [replica:*] sections")
 
@@ -977,27 +1007,30 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
     def gi(s, k, d):  # get int
         return int(s[k]) if k in s else d
 
-    opts = Options(
-        sync_hosts=gb(sy, "hosts", True),
-        sync_cnames=gb(sy, "cnames", True),
-        sync_groups=gb(sy, "groups", False),
-        sync_adlists=gb(sy, "adlists", False),
-        sync_domains=gb(sy, "domains", False),
-        sync_clients=gb(sy, "clients", False),
-        run_gravity=gb(sy, "run_gravity", True),
-        timeout=gf(sy, "timeout", 8.0),
-        write_timeout=gf(sy, "write_timeout", 30.0),
-        gravity_timeout=gf(sy, "gravity_timeout", 180.0),
-        retries=gi(sy, "retries", 3),
-        verify_tls=gb(sy, "verify_tls", True),
-        min_hosts=gi(sf, "min_hosts", 1),
-        max_shrink_pct=gf(sf, "max_shrink_pct", 50.0),
-        shrink_min=gi(sf, "shrink_min", 5),
-        max_changes=gi(sf, "max_changes", 100),
-        load_probe_max=gf(sf, "load_probe_max", 5.0),
-        backup_dir=os.path.expanduser(sf.get("backup_dir", "") if sf else ""),
-        backup_keep=gi(sf, "backup_keep", 30),
-    )
+    try:
+        opts = Options(
+            sync_hosts=gb(sy, "hosts", True),
+            sync_cnames=gb(sy, "cnames", True),
+            sync_groups=gb(sy, "groups", False),
+            sync_adlists=gb(sy, "adlists", False),
+            sync_domains=gb(sy, "domains", False),
+            sync_clients=gb(sy, "clients", False),
+            run_gravity=gb(sy, "run_gravity", False),
+            timeout=gf(sy, "timeout", 8.0),
+            write_timeout=gf(sy, "write_timeout", 30.0),
+            gravity_timeout=gf(sy, "gravity_timeout", 180.0),
+            retries=gi(sy, "retries", 3),
+            verify_tls=gb(sy, "verify_tls", True),
+            min_hosts=gi(sf, "min_hosts", 1),
+            max_shrink_pct=gf(sf, "max_shrink_pct", 50.0),
+            shrink_min=gi(sf, "shrink_min", 5),
+            max_changes=gi(sf, "max_changes", 100),
+            load_probe_max=gf(sf, "load_probe_max", 5.0),
+            backup_dir=os.path.expanduser(sf.get("backup_dir", "") if sf else ""),
+            backup_keep=gi(sf, "backup_keep", 30),
+        )
+    except ValueError as e:
+        raise HolesyncError("invalid value in [sync]/[safety]: %s" % e)
     # Adlists/domains/clients reference groups; syncing them without groups
     # risks dangling references. Pull groups along automatically.
     if (opts.sync_adlists or opts.sync_domains or opts.sync_clients) and not opts.sync_groups:
@@ -1109,11 +1142,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     drifted = [r for r in results if (not r.in_sync) and r.ok]
 
     if args.check:
-        if drifted:
+        if failures:
+            LOG.error("check: %d replica(s) could not be evaluated: %s",
+                      len(failures), ", ".join(r.name for r in failures))
+        elif drifted:
             LOG.warning("drift: %s", ", ".join(r.name for r in drifted))
-            return 10
-        LOG.info("all replicas in sync")
-        return 0
+        else:
+            LOG.info("all replicas in sync")
+        return check_exit_code(results)
 
     if failures:
         return max(r.code for r in failures)

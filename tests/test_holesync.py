@@ -194,6 +194,81 @@ class TestProcessReplica(unittest.TestCase):
         self.assertIn("rollback succeeded", res.reason)
 
 
+class TestLoadConfig(unittest.TestCase):
+    import tempfile
+
+    def _write(self, text):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False)
+        fh.write(text)
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return fh.name
+
+    _MIN = ("[source]\nurl = http://x\npassword = pw\n\n"
+            "[replica:r1]\nurl = http://y\npassword = pw\n")
+
+    def test_example_config_loads_verbatim(self):
+        # B1: the shipped example uses inline ';' comments — must parse cleanly.
+        example = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "holesync.conf.example")
+        src, replicas, opts, _ = hs.load_config(example)
+        self.assertEqual(src.name, "source")
+        self.assertTrue(opts.sync_hosts)
+        self.assertGreaterEqual(len(replicas), 1)
+
+    def test_password_may_contain_percent(self):
+        # B1: interpolation disabled — a '%' in a password is a literal.
+        path = self._write(self._MIN.replace("password = pw", "password = pa%ss"))
+        src, _, _, _ = hs.load_config(path)
+        self.assertEqual(src.password, "pa%ss")
+
+    def test_run_gravity_defaults_off(self):
+        # B2: omitting run_gravity must NOT enable heavy gravity rebuilds.
+        path = self._write(self._MIN + "\n[sync]\nhosts = true\n")
+        _, _, opts, _ = hs.load_config(path)
+        self.assertFalse(opts.run_gravity)
+
+    def test_dotted_replica_name_preserved(self):
+        # B3: [replica:pihole.lan] must keep its full name, not become 'lan'.
+        path = self._write(self._MIN.replace("replica:r1", "replica:pihole.lan"))
+        _, replicas, _, _ = hs.load_config(path)
+        self.assertEqual(replicas[0].name, "pihole.lan")
+
+    def test_unknown_section_rejected(self):
+        # B3: a typo'd section must fail loudly, not be silently ignored.
+        path = self._write(self._MIN + "\n[safty]\nmin_hosts = 5\n")
+        with self.assertRaises(hs.HolesyncError):
+            hs.load_config(path)
+
+    def test_missing_url_is_config_error(self):
+        path = self._write("[source]\npassword = pw\n\n[replica:r1]\nurl = http://y\npassword = pw\n")
+        with self.assertRaises(hs.HolesyncError):
+            hs.load_config(path)
+
+
+class TestCheckExitCode(unittest.TestCase):
+    def test_all_in_sync(self):
+        rs = [hs.Result("a", ok=True, in_sync=True)]
+        self.assertEqual(hs.check_exit_code(rs), 0)
+
+    def test_drift_returns_10(self):
+        rs = [hs.Result("a", ok=True, in_sync=False)]
+        self.assertEqual(hs.check_exit_code(rs), 10)
+
+    def test_failure_dominates_drift(self):
+        # B4: an unreachable replica must not be reported as "in sync".
+        rs = [hs.Result("a", ok=True, in_sync=False),
+              hs.Result("b", ok=False, code=1)]
+        self.assertEqual(hs.check_exit_code(rs), 1)
+
+    def test_failure_over_in_sync(self):
+        rs = [hs.Result("a", ok=True, in_sync=True),
+              hs.Result("b", ok=False, code=1)]
+        self.assertEqual(hs.check_exit_code(rs), 1)
+
+
 class TestGroupMapping(unittest.TestCase):
     def test_group_maps(self):
         items = [{"id": 0, "name": "Default"}, {"id": 3, "name": "Kids"}]
