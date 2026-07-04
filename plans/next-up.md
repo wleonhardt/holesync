@@ -2,10 +2,10 @@
 
 ## Queue
 - [ ] E4: CI workflow (unittest matrix + pyflakes) — declined for now
-- [ ] E5: README comparison vs nebula-sync/orbital-sync + restore-from-backup note — declined for now
 - [ ] user: replica still on FTL v6.6.1 after source went to v6.6.2 — update pihole-02
 
 ## Done
+- [x] README rewrite in the "boring on purpose" voice (decision recorded in decisions/); includes the E5 comparison vs Teleporter-based tools
 - [x] dhcp.hosts drift: N/A — no Pi-hole serves DHCP on this network (user, 2026-07-03); config_keys stays unset in live conf
 - [x] v1.5.0 — E1 `config_keys` (generic config-layer sync incl. dhcp.hosts; shrink-guarded, verified, rolled back; webserver.* refused), E2 `--replica` filter, E3 FTL version pre-flight. Live-verified: found real dhcp.hosts drift + v6.6/v6.6.1 version skew. [postfix review](review-2026-07-03-postfix.md)
 - [x] v1.4.1 — P1–P6 polish + T1 main() end-to-end tests + T2 retry-logic tests

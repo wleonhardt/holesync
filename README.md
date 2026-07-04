@@ -1,205 +1,191 @@
 # holesync
 
-A small, dependency-free replicator that keeps one or more secondary Pi-holes
-(v6) in lockstep with a primary, using the Pi-hole REST API.
+**The boring way to keep your Pi-holes in sync.**
 
-Its core job is to mirror **local DNS records** (`dns.hosts` and
-`dns.cnameRecords`) with **no DNS downtime** and strong guards against
-propagating a bad read. It can optionally also mirror the gravity-database
-**groups, adlists, and allow/deny domains** — everything you hand-maintain on
-the primary — using the same validate → back up → write → verify discipline.
+Boring is the point: no daemon, no dependencies, no Docker, no drama — one
+Python file, run by cron, that copies your hand-maintained Pi-hole v6 config
+from a primary to your replicas and refuses to do anything reckless along the
+way.
+
+> Most sync tools are exciting right up until they empty your DNS records.
+> holesync is designed to never be exciting.
 
 ```
-┌──────────────┐   read /api/config/dns    ┌──────────────┐
+┌──────────────┐    read once, validate    ┌──────────────┐
 │  Pi-hole #1  │ ────────────────────────► │   holesync   │
 │  (source)    │                           │  (cron job)  │
 └──────────────┘                           └──────┬───────┘
-                                                  │ diff, then PATCH only if changed
+                                                  │ diff → backup → write → verify
+                                                  │ (or, usually: "in sync, bye")
                                                   ▼
-                                          ┌──────────────┐
-                                          │  Pi-hole #2  │
-                                          │  (replica)   │
-                                          └──────────────┘
+                                     ┌──────────────┐  ┌──────────────┐
+                                     │  Pi-hole #2  │  │  Pi-hole #3  │
+                                     └──────────────┘  └──────────────┘
 ```
 
-## Why it exists
+## What it does
 
-Pi-hole's blocklists already keep themselves current — each instance refreshes
-the same adlists on its own schedule, so the *blocked* domains don't need
-syncing. What does drift is the hand-maintained **local DNS** (LAN hostnames and
-CNAMEs) you add on the primary. holesync keeps just that in sync, and nothing
-else, which is what makes it small and low-risk.
+You run two or three Pi-holes so DNS survives a reboot. Blocklists already
+keep themselves current — every instance downloads the same adlists on its own
+schedule. What drifts is everything you edit *by hand* on the primary: local
+DNS records, CNAMEs, groups, allow/deny domains, adlist definitions, client
+assignments. holesync mirrors exactly that, and nothing else.
 
-## Highlights
+The flagship guarantee: **local DNS records sync with zero DNS downtime.**
+Changes go through Pi-hole's live config API, which reloads in place — the
+resolver and its `:53` socket are never restarted. Measured at 0 dropped
+queries while applying a change under load.
 
-- **Zero-downtime writes.** Changes go through the live config API, which
-  reloads DNS in place — the resolver process and its `:53` socket are never
-  restarted. Measured at 0 dropped queries while applying a change under load.
-- **Diff-gated.** If a replica already matches the source, holesync writes
-  nothing at all. A steady-state run is read-only.
-- **Corruption-safe by construction:**
-  - validates every source record before sending it;
-  - a configurable **minimum-record floor** and **drastic-shrink guard** stop a
-    transient source glitch from emptying a healthy replica;
-  - the replica's current state is **backed up to disk** before any write;
-  - every write is **verified by read-back**, and a failed verification is
-    **automatically rolled back**.
-- **Safe to run on a timer.** `flock` prevents overlapping runs; sessions are
-  always closed; transient HTTP errors retry with backoff.
-- **No dependencies.** Python 3 standard library only — runs anywhere, including
-  low-power hardware.
+| Data | Default | Notes |
+| --- | --- | --- |
+| `dns.hosts` (local A/AAAA records) | ✅ on | Config API — in-place reload, zero downtime |
+| `dns.cnameRecords` (local CNAMEs) | ✅ on | Same |
+| Filtering **groups** | ☑️ opt-in | Synced first; everything else references them |
+| **Adlists** (list definitions) | ☑️ opt-in | See the gravity note below |
+| Allow/deny **domains** (exact + regex) | ☑️ opt-in | Apply instantly, no rebuild needed |
+| **Clients** (per-client group assignments) | ☑️ opt-in | IP/MAC/hostname/subnet |
+| Extra **config keys** (`config_keys =`) | ☑️ opt-in | e.g. `dns.upstreams`, `dhcp.hosts` — same zero-downtime PATCH |
+| Resolved blocklist (gravity) domains | ❌ never | Each Pi-hole refreshes its own adlists already |
 
-## Requirements
+Groups, adlists, domains, and clients are matched by **name, not database id**
+— holesync remaps every group reference, so an item on "Kids" lands on the
+replica's "Kids" group even when the two databases assigned different ids.
 
-- Python 3.9+ (standard library only).
-- One source Pi-hole and one or more replicas, all running **Pi-hole v6**
-  (the REST API introduced in v6), reachable over HTTP(S).
-- An admin API password for each Pi-hole.
+## Why not one of the other sync tools?
 
-## Install
+Honest answer: the popular tools (nebula-sync, orbital-sync) work by copying a
+full Teleporter backup from the primary onto each replica. That's simple and
+complete — and importing it **restarts FTL on the replica**, which drops DNS
+for a moment, every sync, whether anything changed or not. They also want a
+Docker host to live on.
+
+holesync makes the opposite trade: granular API writes, diff-gated so a
+steady-state run **writes nothing at all**, no restarts ever, and no runtime
+beyond a Python interpreter. The cost: it deliberately syncs *less* (no
+Teleporter-style everything-copy — see [DESIGN.md](DESIGN.md) for what's out of
+scope and why). If you want a byte-identical clone and don't mind the blip,
+use those tools. If you want your replicas quietly converging with zero
+interruptions, that's this.
+
+## Quickstart
+
+Requirements: Python 3.9+ (stdlib only), Pi-hole **v6** everywhere, an API
+password per Pi-hole.
 
 ```bash
-git clone https://github.com/<you>/holesync.git
-sudo install -m 0755 holesync/holesync.py /usr/local/bin/holesync
+git clone <this-repo> && cd holesync
+sudo install -m 0755 holesync.py /usr/local/bin/holesync
 sudo mkdir -p /etc/holesync /var/lib/holesync/backups
-sudo install -m 0600 holesync/holesync.conf.example /etc/holesync/holesync.conf
-sudoedit /etc/holesync/holesync.conf   # fill in URLs + passwords
+sudo install -m 0600 holesync.conf.example /etc/holesync/holesync.conf
+sudoedit /etc/holesync/holesync.conf     # set urls + passwords
 ```
 
-## Configure
-
-Copy `holesync.conf.example` to `/etc/holesync/holesync.conf`, `chmod 600` it
-(it holds passwords), and edit:
+Minimal config:
 
 ```ini
 [source]
 url = http://10.0.0.10
-password = your-admin-password
+password = app-password-here
 
 [replica:pihole-02]
 url = http://10.0.0.11
-password = your-admin-password
-
-[sync]
-hosts = true
-cnames = true
-# optional gravity-database collections:
-groups = false
-adlists = false
-domains = false
-clients = false
-run_gravity = false
-
-[safety]
-min_hosts = 5
-max_shrink_pct = 50
-max_changes = 100
-backup_dir = /var/lib/holesync/backups
-backup_keep = 30
-
-[log]
-file = /var/log/holesync.log
-level = info
+password = app-password-here
 ```
 
-See [`holesync.conf.example`](holesync.conf.example) for every option with
-inline documentation. Add as many `[replica:<name>]` sections as you have
-replicas. Passwords can be kept out of the file with `password_file =
-/path/to/secret` instead of `password =`.
+Then work up the confidence ladder:
 
-> **2FA / app passwords.** If a Pi-hole has two-factor auth enabled, its plain
-> admin password will not authenticate over the API. Create an **application
-> password** (Settings → Web interface / API → App password) and use that as the
-> `password`/`password_file` value — it bypasses TOTP and is the intended
-> automation credential.
+```bash
+holesync --check      # read-only: what differs? (exit 10 if anything)
+holesync --dry-run    # what *would* it write?
+holesync              # do it
+```
+
+Every option is documented inline in
+[`holesync.conf.example`](holesync.conf.example).
+
+> **2FA?** A Pi-hole with two-factor auth won't accept its admin password over
+> the API. Create an **application password** (Settings → Web interface / API →
+> App password) and use that — it's the intended automation credential. Use
+> `password_file = /path/to/secret` to keep it out of the config file.
 
 ## Usage
 
 ```bash
-holesync --check        # read-only: report drift, exit 10 if any replica differs
-holesync --dry-run      # show what would change, write nothing
-holesync                # apply: sync every replica to the source
-holesync -r pihole-02   # limit the run to one replica (repeatable)
-holesync -v             # add debug logging (per-record diff)
-holesync --force        # apply even past the drastic-shrink guard (bulk deletes)
+holesync --check          # read-only drift report; exit 10 on drift
+holesync --dry-run        # show planned writes, write nothing
+holesync                  # sync every replica to the source
+holesync -r pihole-02     # just this replica (repeatable)
+holesync -v               # per-record debug logging
+holesync --force          # override the safety guards (bulk deletes etc.)
 ```
 
-Exit codes: `0` success (incl. already-in-sync) · `1` runtime error · `2` config
-error · `3` a safety guard aborted a replica · `4` a write failed verification
-(rollback attempted) · `5` another run holds the lock · `10` `--check` found
-drift.
+Exit codes are monitoring-friendly:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | success — synced, or nothing to do |
+| 1 | runtime error |
+| 2 | config error |
+| 3 | a safety guard refused to write |
+| 4 | a write failed verification (rollback attempted) |
+| 5 | another holesync run holds the lock |
+| 10 | `--check` found drift |
+
+`--check` never reports "in sync" when a replica couldn't be reached — an
+unreachable replica is a failure, not a pass.
 
 ## Run it on a schedule
 
-### cron
-
 ```cron
-# /etc/cron.d/holesync — sync local DNS records every 30 minutes
+# /etc/cron.d/holesync — every 30 minutes
 */30 * * * * root /usr/local/bin/holesync -c /etc/holesync/holesync.conf >/dev/null 2>&1
 ```
 
-Because holesync is diff-gated, running it often is cheap — most runs are
-read-only and finish in well under a second.
-
-### systemd timer (alternative)
-
-Unit files are in [`systemd/`](systemd/):
+Or the systemd units in [`systemd/`](systemd/):
 
 ```bash
 sudo cp systemd/holesync.* /etc/systemd/system/
 sudo systemctl enable --now holesync.timer
-systemctl list-timers holesync.timer
 ```
 
-## What it syncs (and what it deliberately doesn't)
+Run it as often as you like. A steady-state run authenticates, reads,
+concludes nothing changed, and leaves — well under a second of the good kind
+of nothing.
 
-| Data | Synced | Notes |
-| --- | --- | --- |
-| `dns.hosts` (local A/AAAA records) | ✅ on | Config API — instant in-place reload, **zero DNS downtime** |
-| `dns.cnameRecords` (local CNAMEs) | ✅ on | Same |
-| Filtering **groups** | ☑️ optional | Synced first so adlist/domain group references resolve |
-| **Adlists** (blocklist/allowlist URLs) | ☑️ optional | The list *definitions*; see gravity note below |
-| Allow/deny **domains** (exact + regex) | ☑️ optional | Apply on their own — no gravity rebuild needed |
-| **Clients** (per-client group assignments) | ☑️ optional | Identified by IP/MAC/hostname/subnet; only useful alongside groups |
-| Extra **config keys** (`config_keys =`) | ☑️ optional | e.g. `dhcp.hosts` (static leases), `dns.upstreams` — same zero-downtime config PATCH; `webserver.*` refused |
-| Resolved blocklist (gravity) domains | ❌ | Each Pi-hole already refreshes the same adlists on its own cron |
+## The safety model
 
-Enable the optional collections in `[sync]`. Groups, adlists, domains, and
-clients are matched by name/value, not by database id — holesync **remaps group
-references by name** so an item on "Kids" lands on the replica's "Kids" group
-even if the two Pi-holes assigned that group different ids.
+This is the part that matters. Every write path answers four questions first:
 
-### A note on applying gravity changes
+1. **Is the source data sane?** Every record is validated (IPs parse,
+   hostnames are hostnames, CNAMEs are well-formed). A minimum-record floor
+   (`min_hosts`) catches a source that suddenly reports next to nothing.
+2. **Is the change plausible?** A **shrink guard** refuses any write that
+   would delete more than `max_shrink_pct` of what a replica has (small edits
+   exempt via `shrink_min`); a **change cap** (`max_changes`) refuses
+   pathological diffs. A genuine bulk change goes through with `--force`.
+3. **Is the replica healthy enough to take it?** Before touching the gravity
+   database, holesync checks the replica's own diagnostics (won't write into a
+   Pi-hole already reporting database trouble) and its responsiveness (defers
+   heavy writes when the replica is busy — `load_probe_max`). It also warns
+   when source and replica run different FTL versions.
+4. **Did the write actually land?** The replica's prior state is **backed up
+   to disk** first (rotated, `backup_keep`), every write is **verified by
+   read-back**, and a failed verification is **rolled back automatically**.
 
-Allow/deny **domains** and **groups** take effect on the replica the moment
-they're written. **Adlist** changes are different: the list of blocked domains
-is only rebuilt by a *gravity* run. holesync leaves `run_gravity = false` by
-default, which means a newly-synced adlist is picked up by the replica's own
-scheduled gravity cron (or your next manual `pihole -g`). Set `run_gravity =
-true` to have holesync rebuild gravity on a replica immediately after its adlists
-change — convenient, but heavier (it downloads and parses every adlist), so it
-only fires when adlists actually changed.
+Writes that do happen are batched (one `:batchDelete`, grouped array-adds) so
+a big sync costs a handful of list reloads on the replica, not one per item —
+which matters on weak hardware (a Pi-hole in a container on NAS storage can be
+wedged by careless bulk writes; see the hard-won lesson in
+[DESIGN.md](DESIGN.md)).
 
-> **On constrained replicas** (e.g. Pi-hole in a container on a NAS), each
-> gravity-collection write triggers a list reload that is IO-heavy. holesync
-> batches writes (one `:batchDelete`, grouped array-adds) to minimise reloads,
-> and protects a weak replica with two pre-flights: it **refuses to write** to a
-> replica already reporting a database problem, and **defers** the collection
-> writes when the replica is slow to answer a trivial request (`load_probe_max`).
-> DNS-record sync — which never touches the gravity database — always proceeds.
-> See [DESIGN.md](DESIGN.md) for the full action→follow-up matrix and rationale.
+### The one gravity caveat
 
-## How a run works
-
-1. Acquire a lock (skip if another run is active).
-2. Authenticate to the source, read `dns.hosts` + `dns.cnameRecords` **once**,
-   and validate them.
-3. For each replica: authenticate, read its current records.
-   - If they already match the source → log and move on (no write).
-   - Otherwise: run the shrink guard, back up the replica's current state,
-     `PATCH` the new records, read them back to verify, and roll back if the
-     verification fails.
-4. Close all sessions and release the lock.
+Allow/deny domains, groups, and clients take effect the moment they're
+written. **Adlist** changes only take effect after a *gravity* run rebuilds
+the blocked-domain set. By default (`run_gravity = false`) holesync leaves
+that to the replica's own scheduled gravity cron; set `run_gravity = true` to
+rebuild immediately after adlists change — heavier, so it only fires when they
+actually changed.
 
 ## Development
 
@@ -207,10 +193,10 @@ only fires when adlists actually changed.
 python3 -m unittest discover -s tests -v
 ```
 
-The test suite covers the validation, diff, equality, and safety-guard logic,
-plus the full per-replica flow (no-op, write, dry-run, shrink-abort, and
-verify-failure-with-rollback) against an in-memory fake client — no network
-required.
+The suite covers validation, diffing, guards, batching, config parsing, retry
+logic, and the full sync flows (including verify-failure → rollback) against
+in-memory fakes — no network needed. Design rationale and the
+what-we-deliberately-don't-do list live in [DESIGN.md](DESIGN.md).
 
 ## License
 
