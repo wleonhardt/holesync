@@ -73,7 +73,7 @@ Requirements: Python 3.9+ (stdlib only), Pi-hole **v6** everywhere, an API
 password per Pi-hole.
 
 ```bash
-git clone <this-repo> && cd holesync
+git clone https://github.com/wleonhardt/holesync.git && cd holesync
 sudo install -m 0755 holesync.py /usr/local/bin/holesync
 sudo mkdir -p /etc/holesync /var/lib/holesync/backups
 sudo install -m 0600 holesync.conf.example /etc/holesync/holesync.conf
