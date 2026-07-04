@@ -354,6 +354,40 @@ class TestReplicaIsolation(unittest.TestCase):
         self.assertEqual(res.code, 1)
 
 
+class TestWriteItemLogging(unittest.TestCase):
+    def _client(self, status, payload):
+        c = hs.PiholeClient.__new__(hs.PiholeClient)
+        c.name = "r1"
+        c.opts = hs.Options()
+        c._request = lambda *a, **k: (status, payload)
+        return c
+
+    def _warnings(self, status, payload):
+        import logging
+        recs = []
+        h = logging.Handler()
+        h.emit = recs.append
+        hs.LOG.addHandler(h)
+        try:
+            st, _ = self._client(status, payload).write_item("POST", "/api/x", {})
+        finally:
+            hs.LOG.removeHandler(h)
+        return st, [r for r in recs if r.levelno >= logging.WARNING]
+
+    def test_204_batchdelete_is_not_a_warning(self):
+        st, warns = self._warnings(204, {})
+        self.assertEqual(st, 204)
+        self.assertEqual(warns, [])            # 204 == success for :batchDelete
+
+    def test_201_created_is_not_a_warning(self):
+        _, warns = self._warnings(201, {})
+        self.assertEqual(warns, [])
+
+    def test_4xx_rejection_is_warned(self):
+        _, warns = self._warnings(400, {"error": {"message": "bad regex"}})
+        self.assertEqual(len(warns), 1)
+
+
 class TestGroupMapping(unittest.TestCase):
     def test_group_maps(self):
         items = [{"id": 0, "name": "Default"}, {"id": 3, "name": "Kids"}]

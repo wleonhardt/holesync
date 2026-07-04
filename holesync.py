@@ -414,10 +414,11 @@ class PiholeClient:
         except HolesyncError:
             return 0, {}
         # status 0 == timeout, tolerated by design (the write may still apply).
-        # Any other non-2xx is a real rejection (e.g. a bad regex, 4xx) that the
+        # Any real non-2xx is a rejection (e.g. a bad regex, 4xx) that the
         # converge step would otherwise report only as an opaque "did not
-        # converge" — surface it here with the server's own message.
-        if status and status not in (200, 201):
+        # converge" — surface it here with the server's own message. (2xx spans
+        # 200/201 for adds/updates and 204 for :batchDelete.)
+        if status and not (200 <= status < 300):
             err = (payload or {}).get("error", {})
             LOG.warning("[%s] %s %s -> %s: %s", self.name, method, path, status,
                         err.get("message") or err or payload)
