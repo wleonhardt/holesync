@@ -118,6 +118,9 @@ class FakeClient:
     def __exit__(self, *exc):
         return False
 
+    def get_version(self):
+        return ""
+
     def get_dns_records(self):
         return hs.DnsRecords(list(self.state.hosts), list(self.state.cnames))
 
@@ -500,6 +503,132 @@ class TestDefaultLockPath(unittest.TestCase):
         self.assertTrue(os.access(os.path.dirname(p), os.W_OK))
 
 
+class TestConfigKeyHelpers(unittest.TestCase):
+    def test_walk_nest_roundtrip(self):
+        cfg = {"dhcp": {"hosts": ["aa:bb", "cc:dd"]}, "dns": {"upstreams": ["1.1.1.1"]}}
+        self.assertEqual(hs.walk_config(cfg, "dhcp.hosts"), ["aa:bb", "cc:dd"])
+        self.assertIsNone(hs.walk_config(cfg, "dhcp.missing"))
+        self.assertIsNone(hs.walk_config(cfg, "dns.upstreams.zero"))  # scalar, not dict
+        self.assertEqual(hs.nest_config("a.b.c", 1), {"a": {"b": {"c": 1}}})
+
+    def test_merge_config_combines_sibling_keys(self):
+        tree = {}
+        hs.merge_config(tree, hs.nest_config("dns.upstreams", ["1.1.1.1"]))
+        hs.merge_config(tree, hs.nest_config("dns.revServers", ["x"]))
+        hs.merge_config(tree, hs.nest_config("dhcp.hosts", ["aa"]))
+        self.assertEqual(tree, {"dns": {"upstreams": ["1.1.1.1"], "revServers": ["x"]},
+                                "dhcp": {"hosts": ["aa"]}})
+
+    def test_parse_config_keys(self):
+        self.assertEqual(hs.parse_config_keys("dhcp.hosts, dns.upstreams"),
+                         ("dhcp.hosts", "dns.upstreams"))
+        self.assertEqual(hs.parse_config_keys(""), ())
+        with self.assertRaises(hs.HolesyncError):
+            hs.parse_config_keys("webserver.api.pwhash")   # would lock us out
+        with self.assertRaises(hs.HolesyncError):
+            hs.parse_config_keys("dns.hosts")               # owned by hosts=
+        with self.assertRaises(hs.HolesyncError):
+            hs.parse_config_keys("bad key!")
+
+
+class FakeConfigClient:
+    name = "fake"
+
+    def __init__(self, cfg, fail_verify=False):
+        self.cfg = cfg
+        self.patches = []
+        self._fail = fail_verify
+
+    def get_config(self):
+        import copy
+        return copy.deepcopy(self.cfg)
+
+    def patch_config(self, tree):
+        self.patches.append(tree)
+        if self._fail:
+            self._fail = False        # simulate a write that didn't stick
+            return
+        hs.merge_config(self.cfg, tree)
+
+
+class TestSyncConfigExtra(unittest.TestCase):
+    def _src(self, **extra):
+        return hs.SourceState(dns=hs.DnsRecords(), config_extra=extra)
+
+    def test_in_sync_no_write(self):
+        c = FakeConfigClient({"dhcp": {"hosts": ["aa:bb,10.0.0.5"]}})
+        changed, drifted = hs._sync_config_extra(
+            c, self._src(**{"dhcp.hosts": ["aa:bb,10.0.0.5"]}),
+            hs.Options(backup_dir=""), "stamp", "r1")
+        self.assertFalse(changed)
+        self.assertEqual(c.patches, [])
+
+    def test_drift_written_and_verified(self):
+        c = FakeConfigClient({"dhcp": {"hosts": []}, "dns": {"upstreams": ["9.9.9.9"]}})
+        src = self._src(**{"dhcp.hosts": ["aa:bb,10.0.0.5"], "dns.upstreams": ["1.1.1.1"]})
+        changed, drifted = hs._sync_config_extra(
+            c, src, hs.Options(backup_dir=""), "stamp", "r1")
+        self.assertTrue(changed)
+        self.assertEqual(len(c.patches), 1)      # both keys in ONE PATCH
+        self.assertEqual(c.cfg["dns"]["upstreams"], ["1.1.1.1"])
+        self.assertEqual(c.cfg["dhcp"]["hosts"], ["aa:bb,10.0.0.5"])
+
+    def test_dry_run_reports_drift_without_writing(self):
+        c = FakeConfigClient({"dhcp": {"hosts": []}})
+        changed, drifted = hs._sync_config_extra(
+            c, self._src(**{"dhcp.hosts": ["aa"]}),
+            hs.Options(backup_dir="", dry_run=True), "stamp", "r1")
+        self.assertFalse(changed)
+        self.assertTrue(drifted)
+        self.assertEqual(c.patches, [])
+
+    def test_list_shrink_guarded(self):
+        big = ["h%d" % i for i in range(20)]
+        c = FakeConfigClient({"dhcp": {"hosts": big}})
+        with self.assertRaises(hs.SafetyAbort):
+            hs._sync_config_extra(c, self._src(**{"dhcp.hosts": ["h1"]}),
+                                  hs.Options(backup_dir=""), "stamp", "r1")
+        self.assertEqual(c.patches, [])
+
+    def test_verify_failure_rolls_back(self):
+        c = FakeConfigClient({"dhcp": {"hosts": ["old"]}}, fail_verify=True)
+        with self.assertRaises(hs.ApiError):
+            hs._sync_config_extra(c, self._src(**{"dhcp.hosts": ["new"]}),
+                                  hs.Options(backup_dir=""), "stamp", "r1")
+        # Two patches: the failed write, then the rollback to the old value.
+        self.assertEqual(len(c.patches), 2)
+        self.assertEqual(c.patches[1], {"dhcp": {"hosts": ["old"]}})
+
+
+class TestReplicaFilter(unittest.TestCase):
+    def setUp(self):
+        import tempfile, logging
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        self.addCleanup(lambda: __import__("importlib").reload(hs))
+        self.conf = os.path.join(self.dir, "t.conf")
+        with open(self.conf, "w") as fh:
+            fh.write("[source]\nurl = http://s\npassword = p\n\n"
+                     "[replica:r1]\nurl = http://r1\npassword = p\n\n"
+                     "[replica:r2]\nurl = http://r2\npassword = p\n\n"
+                     "[log]\nlockfile = %s\n" % os.path.join(self.dir, "t.lock"))
+
+    def test_unknown_replica_is_config_error(self):
+        self.assertEqual(hs.main(["-c", self.conf, "--replica", "nope"]), 2)
+
+    def test_filter_limits_to_named_replica(self):
+        made = []
+
+        def factory(name, *a, **k):
+            made.append(name)
+            return FakeClient(hs.DnsRecords(hosts=["10.0.0.1 a"]))
+        hs.PiholeClient = factory  # type: ignore
+        self.assertEqual(hs.main(["-c", self.conf, "--replica", "r2"]), 0)
+        self.assertEqual(made, ["source", "r2"])   # r1 never touched
+
+
 class TestWriteItemLogging(unittest.TestCase):
     def _client(self, status, payload):
         c = hs.PiholeClient.__new__(hs.PiholeClient)
@@ -514,10 +643,13 @@ class TestWriteItemLogging(unittest.TestCase):
         h = logging.Handler()
         h.emit = recs.append
         hs.LOG.addHandler(h)
+        propagate = hs.LOG.propagate
+        hs.LOG.propagate = False           # keep test output clean
         try:
             st, _ = self._client(status, payload).write_item("POST", "/api/x", {})
         finally:
             hs.LOG.removeHandler(h)
+            hs.LOG.propagate = propagate
         return st, [r for r in recs if r.levelno >= logging.WARNING]
 
     def test_204_batchdelete_is_not_a_warning(self):

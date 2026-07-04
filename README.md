@@ -119,6 +119,7 @@ replicas. Passwords can be kept out of the file with `password_file =
 holesync --check        # read-only: report drift, exit 10 if any replica differs
 holesync --dry-run      # show what would change, write nothing
 holesync                # apply: sync every replica to the source
+holesync -r pihole-02   # limit the run to one replica (repeatable)
 holesync -v             # add debug logging (per-record diff)
 holesync --force        # apply even past the drastic-shrink guard (bulk deletes)
 ```
@@ -160,6 +161,7 @@ systemctl list-timers holesync.timer
 | **Adlists** (blocklist/allowlist URLs) | ☑️ optional | The list *definitions*; see gravity note below |
 | Allow/deny **domains** (exact + regex) | ☑️ optional | Apply on their own — no gravity rebuild needed |
 | **Clients** (per-client group assignments) | ☑️ optional | Identified by IP/MAC/hostname/subnet; only useful alongside groups |
+| Extra **config keys** (`config_keys =`) | ☑️ optional | e.g. `dhcp.hosts` (static leases), `dns.upstreams` — same zero-downtime config PATCH; `webserver.*` refused |
 | Resolved blocklist (gravity) domains | ❌ | Each Pi-hole already refreshes the same adlists on its own cron |
 
 Enable the optional collections in `[sync]`. Groups, adlists, domains, and

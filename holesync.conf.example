@@ -37,6 +37,14 @@ adlists = false       ; blocklist/allowlist URLs (the adlist definitions)
 domains = false       ; allow/deny exact+regex domains (auto-apply, no rebuild)
 clients = false       ; per-client group assignments (only useful with groups)
 
+# Extra config-layer keys to mirror (comma/space-separated dotted paths).
+# These use the same zero-downtime PATCH as hosts/cnames — no gravity DB, no
+# reloads. Useful keys: dhcp.hosts (static DHCP leases, for a hot-standby),
+# dns.upstreams, dns.revServers. List values are shrink-guarded; every write is
+# verified and rolled back on failure. webserver.* is refused (it contains API
+# credentials and would cut the replica off).
+# config_keys = dhcp.hosts
+
 # A gravity rebuild is only needed to apply changed ADLIST *content*; allow/deny
 # domains and groups apply on their own. Leave off to let the replica's own
 # scheduled gravity cron pick up adlist changes; turn on to apply immediately

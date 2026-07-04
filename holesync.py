@@ -53,7 +53,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 LOG = logging.getLogger("holesync")
 
@@ -94,6 +94,9 @@ class Options:
     sync_adlists: bool = False
     sync_domains: bool = False
     sync_clients: bool = False
+    # Extra config-layer keys to mirror (dotted paths, e.g. "dhcp.hosts" for
+    # static DHCP leases). Same zero-downtime PATCH mechanism as dns.hosts.
+    config_keys: tuple = ()
     # Trigger a gravity rebuild on a replica when its adlists change. OFF by
     # default: a rebuild is heavy and only adlist *content* needs it (allow/deny
     # domains and groups apply instantly without it). Leave off to let the
@@ -251,6 +254,59 @@ def shrink_guard(src: DnsRecords, dst: DnsRecords, opts: Options) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Extra config-layer keys (config_keys option)
+# --------------------------------------------------------------------------- #
+def walk_config(cfg: dict, path: str):
+    """Follow a dotted path into a nested config dict; None if absent."""
+    cur = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def nest_config(path: str, value) -> dict:
+    """Inverse of walk_config: ('a.b.c', v) -> {'a': {'b': {'c': v}}}."""
+    for part in reversed(path.split(".")):
+        value = {part: value}
+    return value
+
+
+def merge_config(dst: dict, src: dict) -> dict:
+    """Recursively merge src into dst, so several keys share one PATCH."""
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            merge_config(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
+
+
+_CONFIG_KEY_RE = re.compile(r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
+
+
+def parse_config_keys(raw: str) -> tuple:
+    """Validate the config_keys option: dotted paths, comma/space separated.
+
+    Rejects keys holesync already owns, and everything under webserver.* —
+    that subtree holds API credentials/ports, and pushing the source's values
+    would cut holesync (and the user) off from the replica."""
+    keys = tuple(k for k in re.split(r"[,\s]+", raw) if k)
+    for k in keys:
+        if not _CONFIG_KEY_RE.match(k):
+            raise HolesyncError("config_keys: invalid key %r" % k)
+        if k in ("dns.hosts", "dns.cnameRecords"):
+            raise HolesyncError(
+                "config_keys: %r is already synced by the hosts/cnames options" % k)
+        if k == "webserver" or k.startswith("webserver."):
+            raise HolesyncError(
+                "config_keys: refusing %r — webserver settings include API "
+                "credentials and can lock holesync out of the replica" % k)
+    return keys
+
+
+# --------------------------------------------------------------------------- #
 # Pi-hole v6 API client
 # --------------------------------------------------------------------------- #
 class PiholeClient:
@@ -381,13 +437,34 @@ class PiholeClient:
             dns["cnameRecords"] = normalize(rec.cnames)
         if not dns:
             return
-        status, payload = self._request("PATCH", "/api/config", {"config": {"dns": dns}})
+        self.patch_config({"dns": dns})
+
+    def get_config(self) -> dict:
+        """The full config tree (for the extra config_keys sync)."""
+        status, payload = self._request("GET", "/api/config")
+        if status != 200:
+            raise ApiError("[%s] GET /api/config -> %s" % (self.name, status))
+        return payload.get("config") or {}
+
+    def patch_config(self, subtree: dict) -> None:
+        status, payload = self._request("PATCH", "/api/config", {"config": subtree})
         if status not in (200, 201):
             err = (payload or {}).get("error", {})
             raise ApiError(
                 "[%s] PATCH /api/config -> %s: %s"
                 % (self.name, status, err.get("message") or err or payload)
             )
+
+    def get_version(self) -> str:
+        """This Pi-hole's FTL version string (e.g. 'v6.6'); '' if unavailable."""
+        try:
+            status, payload = self._request("GET", "/api/info/version", max_attempts=1)
+        except HolesyncError:
+            return ""
+        if status != 200:
+            return ""
+        ftl = (payload.get("version") or {}).get("ftl") or {}
+        return str((ftl.get("local") or {}).get("version") or "")
 
     # -- gravity-database collections --------------------------------------- #
     def get_collection(self, kind: str) -> list[dict]:
@@ -782,6 +859,8 @@ class SourceState:
     domains: list = dataclasses.field(default_factory=list)
     clients: list = dataclasses.field(default_factory=list)
     group_id2name: dict = dataclasses.field(default_factory=dict)
+    config_extra: dict = dataclasses.field(default_factory=dict)  # key -> value
+    ftl_version: str = ""
 
 
 def validate_source_collections(source: SourceState, opts: Options) -> None:
@@ -846,6 +925,63 @@ def _sync_dns_records(client: "PiholeClient", source: DnsRecords, opts: Options,
     rolled = records_equal(current, client.get_dns_records(), opts)
     raise ApiError("[%s] dns verify failed; rollback %s"
                    % (name, "succeeded" if rolled else "FAILED"))
+
+
+def _sync_config_extra(client: "PiholeClient", source: SourceState, opts: Options,
+                       stamp: str, name: str) -> tuple[bool, bool]:
+    """Sync the extra config_keys. Returns (changed, drifted).
+
+    Same discipline as DNS records — diff-gate, shrink-guard list values, back
+    up the replica's old values, one PATCH for all drifted keys, verify by
+    read-back, roll back on a failed verification."""
+    cfg = client.get_config()
+    to_write: dict = {}
+    old: dict = {}
+    for key, sval in source.config_extra.items():
+        rval = walk_config(cfg, key)
+        if sval == rval:
+            continue
+        if isinstance(sval, list) and isinstance(rval, list) and not opts.force:
+            drop = len(rval) - len(sval)
+            if (drop > opts.shrink_min
+                    and len(sval) < len(rval) * (1.0 - opts.max_shrink_pct / 100.0)):
+                raise SafetyAbort(
+                    "config %s would drop %d -> %d entries (> %.0f%% shrink) — "
+                    "refusing without --force"
+                    % (key, len(rval), len(sval), opts.max_shrink_pct))
+        to_write[key] = sval
+        old[key] = rval
+    if not to_write:
+        LOG.info("[%s] config keys already in sync (%s)",
+                 name, ", ".join(sorted(source.config_extra)))
+        return False, False
+
+    LOG.info("[%s] config drift: %s", name, ", ".join(sorted(to_write)))
+    if opts.dry_run:
+        return False, True
+    if opts.backup_dir:
+        _backup_collection(name, "config", old, opts, stamp)
+
+    tree: dict = {}
+    for key, val in to_write.items():
+        merge_config(tree, nest_config(key, val))
+    client.patch_config(tree)
+
+    after = client.get_config()
+    bad = sorted(k for k, v in to_write.items() if walk_config(after, k) != v)
+    if not bad:
+        LOG.info("[%s] config keys synced: %s", name, ", ".join(sorted(to_write)))
+        return True, True
+
+    LOG.error("[%s] config verify FAILED for %s — rolling back", name, ", ".join(bad))
+    tree = {}
+    for key, val in old.items():
+        if val is not None:   # a key absent on the replica can't be un-set via PATCH
+            merge_config(tree, nest_config(key, val))
+    if tree:
+        client.patch_config(tree)
+    raise ApiError("[%s] config verify failed for %s; rollback attempted"
+                   % (name, ", ".join(bad)))
 
 
 def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
@@ -942,8 +1078,17 @@ def process_replica(rcfg: ReplicaConfig, source: SourceState, opts: Options, sta
         client = PiholeClient(rcfg.name, rcfg.url, rcfg.password, opts)
         with client:
             changed = drifted = False
+            ver = client.get_version()
+            if ver and source.ftl_version and ver != source.ftl_version:
+                LOG.warning("[%s] FTL %s differs from source FTL %s — sync should "
+                            "work, but keep Pi-hole versions aligned",
+                            rcfg.name, ver, source.ftl_version)
             if opts.sync_hosts or opts.sync_cnames:
                 ch, dr = _sync_dns_records(client, source.dns, opts, stamp, rcfg.name)
+                changed |= ch
+                drifted |= dr
+            if opts.config_keys:
+                ch, dr = _sync_config_extra(client, source, opts, stamp, rcfg.name)
                 changed |= ch
                 drifted |= dr
             if opts.sync_gravity:
@@ -1067,6 +1212,7 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
             load_probe_max=gf(sf, "load_probe_max", 5.0),
             backup_dir=os.path.expanduser(sf.get("backup_dir", "") if sf else ""),
             backup_keep=gi(sf, "backup_keep", 30),
+            config_keys=parse_config_keys(sy.get("config_keys", "") if sy else ""),
         )
     except ValueError as e:
         raise HolesyncError("invalid value in [sync]/[safety]: %s" % e)
@@ -1144,6 +1290,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="read-only drift check; exit 10 if any replica is out of sync")
     ap.add_argument("--force", action="store_true",
                     help="bypass the drastic-shrink guard")
+    ap.add_argument("-r", "--replica", action="append", metavar="NAME",
+                    help="limit this run to the named replica (repeatable)")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("-V", "--version", action="version", version="holesync " + __version__)
     args = ap.parse_args(argv)
@@ -1153,6 +1301,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     except HolesyncError as e:
         print("config error: %s" % e, file=sys.stderr)
         return 2
+
+    if args.replica:
+        byname = {r.name: r for r in replicas}
+        unknown = [n for n in args.replica if n not in byname]
+        if unknown:
+            print("config error: unknown replica(s): %s (known: %s)"
+                  % (", ".join(unknown), ", ".join(sorted(byname))), file=sys.stderr)
+            return 2
+        replicas = [byname[n] for n in args.replica]
 
     opts.dry_run = args.dry_run or args.check
     opts.force = args.force
@@ -1175,6 +1332,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Read the source ONCE; validate before touching any replica.
         with PiholeClient(src_cfg.name, src_cfg.url, src_cfg.password, opts) as sc:
             source = SourceState(dns=sc.get_dns_records())
+            source.ftl_version = sc.get_version()
+            if source.ftl_version:
+                LOG.info("source FTL %s", source.ftl_version)
+            if opts.config_keys:
+                cfg = sc.get_config()
+                for key in opts.config_keys:
+                    val = walk_config(cfg, key)
+                    if val is None:
+                        raise HolesyncError(
+                            "source config has no key %r (check config_keys)" % key)
+                    source.config_extra[key] = val
             if opts.sync_groups:
                 source.groups = sc.get_collection("groups")
                 source.group_id2name, _ = group_maps(source.groups)
