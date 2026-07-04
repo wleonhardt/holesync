@@ -1,6 +1,12 @@
 # holesync configuration — copy to /etc/holesync/holesync.conf and chmod 600.
 # Secrets live in this file, so keep it out of version control.
 
+# Passwords: if a Pi-hole has 2FA enabled, its plain admin password will NOT
+# authenticate over the API — create an *application password* (web UI:
+# Settings -> Web interface / API -> App password) and use that instead. App
+# passwords also survive an admin-password change and are the documented
+# automation credential. Prefer password_file to keep the secret out of this file.
+
 # The authoritative Pi-hole. holesync reads from here and never writes to it.
 [source]
 url = http://10.0.0.10
@@ -62,4 +68,8 @@ backup_keep = 30      ; rotations to retain per replica
 [log]
 file = /var/log/holesync.log
 level = info          ; debug|info|warning|error
-lockfile = /tmp/holesync.lock
+# Default /run/holesync/holesync.lock (created by the systemd unit's
+# RuntimeDirectory=, or by holesync itself; falls back to the temp dir if
+# unwritable). Kept out of /tmp so a systemd run with PrivateTmp=true and a
+# manual CLI run still exclude each other.
+lockfile = /run/holesync/holesync.lock

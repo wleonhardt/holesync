@@ -269,6 +269,91 @@ class TestCheckExitCode(unittest.TestCase):
         self.assertEqual(hs.check_exit_code(rs), 1)
 
 
+class TestBackupRotation(unittest.TestCase):
+    def _dir(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return d
+
+    def _touch(self, d, name):
+        open(os.path.join(d, name), "w").close()
+
+    def test_dns_and_collection_pools_are_independent(self):
+        # B5: rotating the DNS series must not evict the collection series
+        # (the old "name-" prefix matched "name-domains-…" too).
+        d = self._dir()
+        opts = hs.Options(backup_dir=d, backup_keep=2)
+        stamps = ["20260101T000001", "20260101T000002", "20260101T000003"]
+        for s in stamps:
+            self._touch(d, "r1-%s.json" % s)          # DNS backups
+            self._touch(d, "r1-domains-%s.json" % s)  # collection backups
+        hs._rotate_backups("r1", opts)                # rotate DNS series only
+        left = sorted(os.listdir(d))
+        # DNS trimmed to 2; all 3 domain backups untouched.
+        self.assertEqual([f for f in left if "domains" not in f],
+                         ["r1-20260101T000002.json", "r1-20260101T000003.json"])
+        self.assertEqual(len([f for f in left if "domains" in f]), 3)
+
+    def test_collection_series_trimmed_by_kind(self):
+        d = self._dir()
+        opts = hs.Options(backup_dir=d, backup_keep=1)
+        for s in ["20260101T000001", "20260101T000002"]:
+            self._touch(d, "r1-clients-%s.json" % s)
+        hs._rotate_backups("r1-clients", opts)
+        self.assertEqual(os.listdir(d), ["r1-clients-20260101T000002.json"])
+
+
+class TestLock(unittest.TestCase):
+    def _path(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        return os.path.join(d, "sub", "holesync.lock")
+
+    def test_second_acquire_is_blocked(self):
+        p = self._path()
+        a = hs.acquire_lock(p)              # creates parent dir too
+        self.assertIsNotNone(a)
+        b = hs.acquire_lock(p)
+        self.assertIsNone(b)               # already held
+        a.close()                          # releasing lets it be re-taken
+        c = hs.acquire_lock(p)
+        self.assertIsNotNone(c)
+        c.close()
+
+    def test_failed_acquire_preserves_holder_pid(self):
+        # Opening must not truncate a held lockfile.
+        p = self._path()
+        a = hs.acquire_lock(p)
+        with open(p) as fh:
+            self.assertEqual(fh.read().strip(), str(os.getpid()))
+        self.assertIsNone(hs.acquire_lock(p))  # second attempt
+        with open(p) as fh:
+            self.assertEqual(fh.read().strip(), str(os.getpid()))  # still intact
+        a.close()
+
+
+class TestReplicaIsolation(unittest.TestCase):
+    def test_unexpected_error_becomes_failure_result(self):
+        # W2: a KeyError from a malformed replica item must be caught per-replica,
+        # not propagate and abort every other replica.
+        class Boom:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def get_dns_records(self): raise KeyError("type")
+        hs.PiholeClient = lambda *a, **k: Boom()  # type: ignore
+        self.addCleanup(lambda: __import__("importlib").reload(hs))
+        import logging
+        logging.disable(logging.CRITICAL)          # silence the expected traceback
+        self.addCleanup(logging.disable, logging.NOTSET)
+        rcfg = hs.ReplicaConfig(name="r1", url="http://x", password="p")
+        res = hs.process_replica(rcfg, hs.SourceState(dns=hs.DnsRecords(hosts=["10.0.0.1 a"])),
+                                 hs.Options(backup_dir=""), "stamp")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.code, 1)
+
+
 class TestGroupMapping(unittest.TestCase):
     def test_group_maps(self):
         items = [{"id": 0, "name": "Default"}, {"id": 3, "name": "Kids"}]

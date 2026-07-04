@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/holesync -c /etc/holesync/holesync.conf
 Nice=10
+# Creates /run/holesync (writable under ProtectSystem=strict) for the lockfile.
+RuntimeDirectory=holesync
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict

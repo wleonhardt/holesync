@@ -93,7 +93,7 @@ run_gravity = false
 [safety]
 min_hosts = 5
 max_shrink_pct = 50
-max_changes = 25
+max_changes = 100
 backup_dir = /var/lib/holesync/backups
 backup_keep = 30
 
@@ -106,6 +106,12 @@ See [`holesync.conf.example`](holesync.conf.example) for every option with
 inline documentation. Add as many `[replica:<name>]` sections as you have
 replicas. Passwords can be kept out of the file with `password_file =
 /path/to/secret` instead of `password =`.
+
+> **2FA / app passwords.** If a Pi-hole has two-factor auth enabled, its plain
+> admin password will not authenticate over the API. Create an **application
+> password** (Settings → Web interface / API → App password) and use that as the
+> `password`/`password_file` value — it bypasses TOTP and is the intended
+> automation credential.
 
 ## Usage
 
@@ -127,7 +133,7 @@ drift.
 ### cron
 
 ```cron
-# /etc/cron.d/holesync — sync local DNS records hourly
+# /etc/cron.d/holesync — sync local DNS records every 30 minutes
 */30 * * * * root /usr/local/bin/holesync -c /etc/holesync/holesync.conf >/dev/null 2>&1
 ```
 

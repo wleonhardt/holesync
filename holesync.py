@@ -46,12 +46,14 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 LOG = logging.getLogger("holesync")
 
@@ -265,7 +267,10 @@ class PiholeClient:
         if self.base.startswith("https") and not opts.verify_tls:
             import ssl
 
-            self._ctx = ssl._create_unverified_context()
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ctx = ctx
 
     # -- low level ---------------------------------------------------------- #
     def _raw(self, method: str, path: str, body: Optional[dict], timeout: float):
@@ -404,10 +409,19 @@ class PiholeClient:
         caller's read-back/converge step decide whether the change actually
         landed."""
         try:
-            return self._request(method, path, body,
-                                 timeout=self.opts.write_timeout, max_attempts=1)
+            status, payload = self._request(method, path, body,
+                                            timeout=self.opts.write_timeout, max_attempts=1)
         except HolesyncError:
             return 0, {}
+        # status 0 == timeout, tolerated by design (the write may still apply).
+        # Any other non-2xx is a real rejection (e.g. a bad regex, 4xx) that the
+        # converge step would otherwise report only as an opaque "did not
+        # converge" — surface it here with the server's own message.
+        if status and status not in (200, 201):
+            err = (payload or {}).get("error", {})
+            LOG.warning("[%s] %s %s -> %s: %s", self.name, method, path, status,
+                        err.get("message") or err or payload)
+        return status, payload
 
     def batch_delete(self, kind: str, keys: list) -> None:
         """Delete many items in one call via /api/<kind>:batchDelete."""
@@ -719,14 +733,21 @@ def write_backup(name: str, rec: DnsRecords, opts: Options, stamp: str) -> Optio
     return path
 
 
-def _rotate_backups(name: str, opts: Options) -> None:
+_STAMP_RE = r"\d{8}T\d{6}"
+
+
+def _rotate_backups(base: str, opts: Options) -> None:
+    """Trim backups for one series to backup_keep.
+
+    ``base`` is the filename stem: the replica name for DNS backups
+    (``name-<stamp>.json``) or ``name-<kind>`` for a collection
+    (``name-kind-<stamp>.json``). Matching an EXACT ``base-<stamp>.json``
+    keeps the series separate — otherwise the DNS series' ``name-`` prefix also
+    matches ``name-domains-…`` and the two pools evict each other."""
     if opts.backup_keep <= 0:
         return
-    prefix = name + "-"
-    files = sorted(
-        f for f in os.listdir(opts.backup_dir)
-        if f.startswith(prefix) and f.endswith(".json")
-    )
+    pat = re.compile(r"^%s-%s\.json$" % (re.escape(base), _STAMP_RE))
+    files = sorted(f for f in os.listdir(opts.backup_dir) if pat.match(f))
     for stale in files[: max(0, len(files) - opts.backup_keep)]:
         try:
             os.remove(os.path.join(opts.backup_dir, stale))
@@ -934,6 +955,10 @@ def process_replica(rcfg: ReplicaConfig, source: SourceState, opts: Options, sta
         LOG.error("%s", e)
         return Result(rcfg.name, ok=False, code=4 if "verify failed" in str(e) else 1,
                       reason=str(e))
+    except Exception as e:  # noqa: BLE001 — isolate: one bad replica must not
+        # abort the others (e.g. a KeyError from a malformed replica-side item).
+        LOG.exception("[%s] unexpected error", rcfg.name)
+        return Result(rcfg.name, ok=False, code=1, reason=str(e))
 
 
 # --------------------------------------------------------------------------- #
@@ -1058,11 +1083,25 @@ def setup_logging(logcfg: dict, verbose: bool) -> None:
 
 
 def acquire_lock(path: str):
-    fh = open(path, "w")
+    """Take an exclusive advisory lock. Returns the open handle, or None if
+    another run already holds it. Opens without truncating (so a failed attempt
+    can't clobber the holder's PID) and never unlinks the file (unlink-then-
+    recreate is the classic flock race that lets two runs both 'hold' it)."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fh = open(path, "a+")
+    except OSError as e:
+        fallback = os.path.join(tempfile.gettempdir(), "holesync.lock")
+        LOG.warning("lockfile %s unavailable (%s) — falling back to %s",
+                    path, e, fallback)
+        fh = open(fallback, "a+")
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        fh.close()
         return None
+    fh.seek(0)
+    fh.truncate()
     fh.write(str(os.getpid()))
     fh.flush()
     return fh
@@ -1095,7 +1134,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     opts.force = args.force
     setup_logging(logcfg, args.verbose)
 
-    lock_path = logcfg.get("lockfile", "/tmp/holesync.lock")
+    # Default outside /tmp: systemd PrivateTmp=true gives the unit a private
+    # /tmp, so a /tmp lock can't exclude a manual CLI run. /run/holesync is
+    # created by the unit's RuntimeDirectory= (and by acquire_lock otherwise).
+    lock_path = logcfg.get("lockfile", "/run/holesync/holesync.lock")
     lock = acquire_lock(lock_path)
     if lock is None:
         LOG.warning("another holesync run holds %s — exiting", lock_path)
@@ -1130,10 +1172,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         LOG.error("%s", e)
         return 1
     finally:
+        # Closing the fd releases the flock. Deliberately do NOT unlink the
+        # lockfile — unlink-then-recreate races let two runs both acquire it.
         try:
             fcntl.flock(lock, fcntl.LOCK_UN)
             lock.close()
-            os.unlink(lock_path)
         except OSError:
             pass
 
