@@ -1,5 +1,7 @@
 # holesync
 
+[![CI](https://github.com/wleonhardt/holesync/actions/workflows/ci.yml/badge.svg)](https://github.com/wleonhardt/holesync/actions/workflows/ci.yml)
+
 **The boring way to keep your Pi-holes in sync.**
 
 Boring is the point: no daemon, no dependencies, no Docker, no drama — one

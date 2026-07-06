@@ -7,6 +7,7 @@
 
 ## Non-negotiable rules
 - `python3 -m unittest discover -s tests` must pass before work is done.
+- Keep `pyflakes holesync.py tests/test_holesync.py` clean — CI (`.github/workflows/ci.yml`) runs it plus the unittest matrix (py3.9–3.14) on every push/PR.
 - No third-party dependencies — Python 3.9+ stdlib only (core design goal).
 - Single-file tool: all logic stays in `holesync.py`.
 - Any new gravity-DB write must be batched, diff-gated, and behind the load pre-flight (see DESIGN.md checklist).
