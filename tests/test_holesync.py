@@ -495,11 +495,14 @@ class TestMainEndToEnd(unittest.TestCase):
 
 class TestDefaultLockPath(unittest.TestCase):
     def test_nonroot_default_is_writable_dir(self):
-        # P6: unprivileged runs must not default to /run (permission noise).
+        # P6: unprivileged runs must not default to the root-only /run/holesync
+        # path (permission noise); the chosen dir must actually be writable.
+        # (A non-root path CAN legitimately live under /run — XDG_RUNTIME_DIR is
+        # /run/user/<uid> on Linux — so check writability, not the prefix.)
         if os.geteuid() == 0:
             self.skipTest("running as root")
         p = hs.default_lock_path()
-        self.assertFalse(p.startswith("/run/"))
+        self.assertNotEqual(p, "/run/holesync/holesync.lock")
         self.assertTrue(os.access(os.path.dirname(p), os.W_OK))
 
 
