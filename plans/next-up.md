@@ -6,6 +6,7 @@
 - [ ] optional: deployed primary config syncs hosts+cnames only — could enable groups/adlists/domains/clients (tested working). Scope decision for the user.
 
 ## Done
+- [x] Ultra-review fix batch (bc0505d): closed the 15 verified findings from [review-2026-07-13-ultra](review-2026-07-13-ultra.md) — lock mutual-exclusion (no silent tempdir relocation, LockError, RuntimeDirectoryPreserve, writable-XDG check), config_keys leaf-only + ConfigError exit 2 + order-insensitive compare, parser password truncation/UnicodeDecodeError, retries=0 crash, duplicate replica names, VerifyError type, shared drastic_shrink, run_gravity branch coverage, docs. 97 tests, live-verified.
 - [x] E4 — GitHub Actions CI: unittest matrix (py3.9–3.14) + pyflakes on push/PR; badge in README. pyflakes verified clean locally.
 - [x] Deployed v1.5.0 to primary PiHole1 (2026-07-06): in-place upgrade from a stale 1.2.0 cron install. Backed up old binary -> /usr/local/bin/holesync.1.2.0.bak, verified --check/--dry-run exit 0 against the live deployed config; existing */30 cron already points at /usr/local/bin/holesync (kept cron, not systemd — it works and avoids lockfile-path coordination). Confirmed cron has been firing (17:00–19:00 runs logged).
 - [x] Pushed all local commits (were already in sync with origin) + annotated tag v1.5.0 -> github.com/wleonhardt/holesync.
