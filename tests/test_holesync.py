@@ -198,8 +198,6 @@ class TestProcessReplica(unittest.TestCase):
 
 
 class TestLoadConfig(unittest.TestCase):
-    import tempfile
-
     def _write(self, text):
         import tempfile
         fh = tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False)
@@ -344,6 +342,7 @@ class TestReplicaIsolation(unittest.TestCase):
         class Boom:
             def __enter__(self): return self
             def __exit__(self, *a): return False
+            def get_version(self): return ""      # so the KeyError path is reached
             def get_dns_records(self): raise KeyError("type")
         hs.PiholeClient = lambda *a, **k: Boom()  # type: ignore
         self.addCleanup(lambda: __import__("importlib").reload(hs))
@@ -394,6 +393,43 @@ class TestConfigErrorPaths(unittest.TestCase):
         with self.assertRaises(hs.HolesyncError):
             hs.load_config(path)
 
+    def test_duplicate_replica_name_rejected(self):
+        # Two sections resolving to the same name would share backup filenames.
+        path = self._write(self._MIN + "\n[replica.r1]\nurl = http://z\npassword = p\n")
+        with self.assertRaises(hs.HolesyncError) as cm:
+            hs.load_config(path)
+        self.assertIn("duplicate replica name", str(cm.exception))
+
+    def test_password_with_hash_or_semicolon_not_truncated(self):
+        # Inline-comment stripping is OFF: passwords keep ' #'/' ;' verbatim.
+        for pw in ["pass #word", "s3cr;et", "#leadinghash", "a b ; c"]:
+            path = self._write(self._MIN.replace("password = pw", "password = " + pw, 1))
+            src, _, _, _ = hs.load_config(path)
+            self.assertEqual(src.password, pw)
+
+    def test_non_utf8_config_is_config_error(self):
+        # A Latin-1 byte must yield a clean HolesyncError, not a traceback.
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("wb", suffix=".conf", delete=False)
+        fh.write(b"[source]\nurl = http://x\npassword = caf\xe9\n\n"
+                 b"[replica:r1]\nurl = http://y\npassword = p\n")
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        with self.assertRaises(hs.HolesyncError):
+            hs.load_config(fh.name)
+
+    def test_non_utf8_password_file_is_config_error(self):
+        import tempfile
+        pwf = tempfile.NamedTemporaryFile("wb", delete=False)
+        pwf.write(bytes([0xf0, 0x28, 0x8c, 0x28]))   # invalid UTF-8
+        pwf.close()
+        self.addCleanup(os.unlink, pwf.name)
+        path = self._write(self._MIN.replace(
+            "password = pw", "password_file = " + pwf.name, 1))
+        with self.assertRaises(hs.HolesyncError) as cm:
+            hs.load_config(path)
+        self.assertIn("password_file", str(cm.exception))
+
 
 class TestRequestRetries(unittest.TestCase):
     """T2: _request retry decisions, with a scripted _raw and no real sleeping."""
@@ -441,6 +477,13 @@ class TestRequestRetries(unittest.TestCase):
         status, _ = c._request("GET", "/api/x")
         self.assertEqual(status, 200)
         self.assertEqual(len(calls), 2)
+
+    def test_zero_retries_does_not_crash(self):
+        # A misconfigured retries=0 must not leave 'status' unbound; clamp to 1.
+        c, calls = self._client([(200, b"{}")], retries=0)
+        status, _ = c._request("GET", "/api/x")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(calls), 1)
 
 
 class TestMainEndToEnd(unittest.TestCase):
@@ -533,6 +576,26 @@ class TestConfigKeyHelpers(unittest.TestCase):
         with self.assertRaises(hs.HolesyncError):
             hs.parse_config_keys("bad key!")
 
+    def test_config_has_key_distinguishes_null_from_absent(self):
+        cfg = {"dns": {"upstreams": None, "port": 53}}
+        self.assertTrue(hs.config_has_key(cfg, "dns.upstreams"))   # present, null
+        self.assertTrue(hs.config_has_key(cfg, "dns.port"))
+        self.assertFalse(hs.config_has_key(cfg, "dns.missing"))
+        self.assertIsNone(hs.walk_config(cfg, "dns.upstreams"))     # can't tell null
+
+    def test_config_values_equal_lists_order_insensitive(self):
+        self.assertTrue(hs.config_values_equal(["a", "b"], ["b", "a"]))
+        self.assertFalse(hs.config_values_equal(["a", "b"], ["a", "b", "c"]))
+        self.assertTrue(hs.config_values_equal("x", "x"))
+        self.assertFalse(hs.config_values_equal(True, False))
+        self.assertTrue(hs.config_values_equal([1, 2, 2], [2, 1, 2]))  # multiset
+
+    def test_drastic_shrink_predicate(self):
+        opts = hs.Options(max_shrink_pct=50, shrink_min=5)
+        self.assertTrue(hs.drastic_shrink(1, 20, opts))    # 20->1: drastic
+        self.assertFalse(hs.drastic_shrink(18, 20, opts))  # 20->18: modest
+        self.assertFalse(hs.drastic_shrink(0, 3, opts))    # under shrink_min
+
 
 class FakeConfigClient:
     name = "fake"
@@ -595,12 +658,36 @@ class TestSyncConfigExtra(unittest.TestCase):
 
     def test_verify_failure_rolls_back(self):
         c = FakeConfigClient({"dhcp": {"hosts": ["old"]}}, fail_verify=True)
-        with self.assertRaises(hs.ApiError):
+        with self.assertRaises(hs.VerifyError):     # typed, not string-matched
             hs._sync_config_extra(c, self._src(**{"dhcp.hosts": ["new"]}),
                                   hs.Options(backup_dir=""), "stamp", "r1")
         # Two patches: the failed write, then the rollback to the old value.
         self.assertEqual(len(c.patches), 2)
         self.assertEqual(c.patches[1], {"dhcp": {"hosts": ["old"]}})
+
+    def test_reordered_list_is_not_drift(self):
+        # A replica list in a different order must NOT trigger a rewrite.
+        c = FakeConfigClient({"dns": {"upstreams": ["8.8.8.8", "1.1.1.1"]}})
+        changed, drifted = hs._sync_config_extra(
+            c, self._src(**{"dns.upstreams": ["1.1.1.1", "8.8.8.8"]}),
+            hs.Options(backup_dir=""), "stamp", "r1")
+        self.assertFalse(changed)
+        self.assertFalse(drifted)
+        self.assertEqual(c.patches, [])
+
+    def test_reorder_on_write_does_not_fail_verify(self):
+        # If the replica echoes the written list reordered, verify must pass.
+        class Reorderer(FakeConfigClient):
+            def patch_config(self, tree):
+                self.patches.append(tree)
+                v = tree["dns"]["upstreams"]
+                hs.merge_config(self.cfg, {"dns": {"upstreams": list(reversed(v))}})
+        c = Reorderer({"dns": {"upstreams": []}})
+        changed, drifted = hs._sync_config_extra(
+            c, self._src(**{"dns.upstreams": ["1.1.1.1", "8.8.8.8"]}),
+            hs.Options(backup_dir=""), "stamp", "r1")
+        self.assertTrue(changed)
+        self.assertEqual(len(c.patches), 1)         # wrote once, no rollback
 
 
 class TestReplicaFilter(unittest.TestCase):
@@ -630,6 +717,98 @@ class TestReplicaFilter(unittest.TestCase):
         hs.PiholeClient = factory  # type: ignore
         self.assertEqual(hs.main(["-c", self.conf, "--replica", "r2"]), 0)
         self.assertEqual(made, ["source", "r2"])   # r1 never touched
+
+    def test_repeated_replica_flag_is_deduplicated(self):
+        made = []
+
+        def factory(name, *a, **k):
+            made.append(name)
+            return FakeClient(hs.DnsRecords(hosts=["10.0.0.1 a"]))
+        hs.PiholeClient = factory  # type: ignore
+        self.assertEqual(hs.main(["-c", self.conf, "-r", "r2", "-r", "r2"]), 0)
+        self.assertEqual(made, ["source", "r2"])   # r2 processed once, not twice
+
+
+class FakeConfigMainClient:
+    """A source/replica fake exposing the config surface main() drives."""
+    def __init__(self, cfg):
+        self.cfg = cfg
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def get_version(self): return ""
+    def get_dns_records(self): return hs.DnsRecords()
+    def get_config(self):
+        import copy
+        return copy.deepcopy(self.cfg)
+    def patch_config(self, tree): hs.merge_config(self.cfg, tree)
+
+
+class TestConfigKeysMain(unittest.TestCase):
+    def setUp(self):
+        import tempfile, logging
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        self.addCleanup(lambda: __import__("importlib").reload(hs))
+
+    def _conf(self, keys):
+        path = os.path.join(self.dir, "t.conf")
+        with open(path, "w") as fh:
+            fh.write("[source]\nurl = http://s\npassword = p\n\n"
+                     "[replica:r1]\nurl = http://r\npassword = p\n\n"
+                     "[sync]\nhosts = false\ncnames = false\nconfig_keys = %s\n\n"
+                     "[log]\nlockfile = %s\n" % (keys, os.path.join(self.dir, "t.lock")))
+        return path
+
+    def test_subtree_key_is_config_error_exit_2(self):
+        # config_keys = dhcp resolves to a dict → exit 2 (config error), not a
+        # guard-bypassing wholesale overwrite.
+        hs.PiholeClient = lambda *a, **k: FakeConfigMainClient(
+            {"dhcp": {"hosts": ["a", "b"], "active": True}})  # type: ignore
+        self.assertEqual(hs.main(["-c", self._conf("dhcp")]), 2)
+
+    def test_absent_key_is_config_error_exit_2(self):
+        # A source that lacks the key → exit 2, not 1 (runtime).
+        hs.PiholeClient = lambda *a, **k: FakeConfigMainClient(
+            {"dns": {"upstreams": ["1.1.1.1"]}})  # type: ignore
+        self.assertEqual(hs.main(["-c", self._conf("dhcp.hostz")]), 2)
+
+    def test_leaf_key_syncs_ok(self):
+        hs.PiholeClient = lambda *a, **k: FakeConfigMainClient(
+            {"dhcp": {"hosts": ["aa:bb,10.0.0.5"]}})  # type: ignore
+        self.assertEqual(hs.main(["-c", self._conf("dhcp.hosts"), "--check"]), 0)
+
+
+class TestLockErrors(unittest.TestCase):
+    def test_unwritable_lock_path_raises_lockerror(self):
+        # A path that cannot be created must raise LockError (not silently
+        # relocate the lock, which would defeat mutual exclusion).
+        with self.assertRaises(hs.LockError):
+            hs.acquire_lock("/proc/nonexistent-dir/holesync.lock")
+
+    def test_main_exits_2_on_lock_error(self):
+        import tempfile, logging
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        conf = os.path.join(d, "t.conf")
+        with open(conf, "w") as fh:
+            fh.write("[source]\nurl = http://s\npassword = p\n\n"
+                     "[replica:r1]\nurl = http://r\npassword = p\n\n"
+                     "[log]\nlockfile = /proc/nope/holesync.lock\n")
+        self.assertEqual(hs.main(["-c", conf]), 2)
+
+    def test_default_lock_path_skips_unwritable_xdg(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root")
+        orig = os.environ.get("XDG_RUNTIME_DIR")
+        os.environ["XDG_RUNTIME_DIR"] = "/proc/nonexistent-xdg"
+        self.addCleanup(lambda: os.environ.__setitem__("XDG_RUNTIME_DIR", orig)
+                        if orig is not None else os.environ.pop("XDG_RUNTIME_DIR", None))
+        p = hs.default_lock_path()
+        self.assertTrue(os.access(os.path.dirname(p), os.W_OK))  # fell back to tmp
 
 
 class TestWriteItemLogging(unittest.TestCase):
@@ -865,6 +1044,60 @@ class FakeGravityClient:
     def batch_delete(self, *a):
         self.calls.append(("DEL", a))
         return 200, {}
+
+    def run_gravity(self):
+        self.calls.append(("GRAVITY",))
+        return True
+
+
+class GravityRebuildClient:
+    """A gravity fake whose adlist writes 'stick', so sync_collection converges
+    and the run_gravity=True branch is reachable."""
+    name = "fake"
+
+    def __init__(self, adlist):
+        self._adlist = adlist
+        self._lists_reads = 0
+        self.gravity_calls = 0
+
+    def get_messages(self): return []
+    def probe(self): return 0.05
+
+    def get_collection(self, kind):
+        if kind == "groups":
+            return [{"id": 0, "name": "Default"}]
+        if kind == "lists":
+            self._lists_reads += 1
+            return [] if self._lists_reads == 1 else [dict(self._adlist)]  # empty→converged
+        return []
+
+    def write_item(self, *a): return 200, {}
+    def batch_delete(self, *a): return 200, {}
+    def run_gravity(self): self.gravity_calls += 1; return True
+
+
+class TestRunGravityBranch(unittest.TestCase):
+    ADLIST = {"type": "block", "address": "http://x", "enabled": True,
+              "comment": "", "groups": [0]}
+
+    def _src(self):
+        return hs.SourceState(dns=hs.DnsRecords(), lists=[dict(self.ADLIST)],
+                              group_id2name={0: "Default"})
+
+    def test_rebuild_fires_when_adlists_change(self):
+        opts = hs.Options(sync_adlists=True, run_gravity=True, backup_dir="",
+                          load_probe_max=5.0)
+        c = GravityRebuildClient(self.ADLIST)
+        changed, drifted = hs._sync_gravity(c, self._src(), opts, "stamp", "r1")
+        self.assertTrue(changed)
+        self.assertEqual(c.gravity_calls, 1)          # rebuild triggered
+
+    def test_rebuild_suppressed_on_dry_run(self):
+        opts = hs.Options(sync_adlists=True, run_gravity=True, backup_dir="",
+                          load_probe_max=5.0, dry_run=True)
+        c = GravityRebuildClient(self.ADLIST)
+        hs._sync_gravity(c, self._src(), opts, "stamp", "r1")
+        self.assertEqual(c.gravity_calls, 0)          # dry-run never rebuilds
 
 
 class TestPreflight(unittest.TestCase):

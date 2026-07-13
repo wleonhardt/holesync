@@ -8,7 +8,11 @@ Type=oneshot
 ExecStart=/usr/local/bin/holesync -c /etc/holesync/holesync.conf
 Nice=10
 # Creates /run/holesync (writable under ProtectSystem=strict) for the lockfile.
+# Preserve=yes so the dir (and a lock a manual run may hold) is NOT deleted when
+# this oneshot exits — deleting it would unlink a held lockfile and let a manual
+# run and the next timer run execute concurrently.
 RuntimeDirectory=holesync
+RuntimeDirectoryPreserve=yes
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict

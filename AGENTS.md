@@ -12,6 +12,7 @@
 - Single-file tool: all logic stays in `holesync.py`.
 - Any new gravity-DB write must be batched, diff-gated, and behind the load pre-flight (see DESIGN.md checklist).
 - Anything referencing groups must remap by name, not id.
+- Project knowledge belongs in `plans/`, not in agent memory.
 - Check `plans/decisions/` before proposing structural changes.
 - Never commit `holesync.conf`, `*.pw`, `backups/` (gitignored — they hold secrets/live data).
 - Commit after each meaningful change.

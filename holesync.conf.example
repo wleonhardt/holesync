@@ -1,5 +1,9 @@
 # holesync configuration — copy to /etc/holesync/holesync.conf and chmod 600.
 # Secrets live in this file, so keep it out of version control.
+#
+# NOTE: comments must be on their OWN line. holesync does not strip inline
+# (end-of-line) comments, because that would corrupt any password containing
+# a '#' or ';'. A password is taken literally — no escaping of '%' etc.
 
 # Passwords: if a Pi-hole has 2FA enabled, its plain admin password will NOT
 # authenticate over the API — create an *application password* (web UI:
@@ -11,7 +15,7 @@
 [source]
 url = http://10.0.0.10
 password = CHANGEME
-# password_file = /etc/holesync/source.pw   ; alternative to inline password
+# password_file = /etc/holesync/source.pw   (alternative to inline password)
 
 # One [replica:<name>] section per Pi-hole to keep in sync with the source.
 [replica:pihole-02]
@@ -26,23 +30,30 @@ password = CHANGEME
 
 [sync]
 # Local DNS (config API — instant in-place reload, zero DNS downtime):
-hosts = true          ; local A/AAAA records (dns.hosts)
-cnames = true         ; local CNAMEs (dns.cnameRecords)
+# hosts  = local A/AAAA records (dns.hosts)
+# cnames = local CNAMEs (dns.cnameRecords)
+hosts = true
+cnames = true
 
 # Gravity-database collections (optional). Groups are pulled in automatically
 # when adlists/domains are enabled, because those reference groups (holesync
 # remaps group ids by name across Pi-holes).
-groups = false        ; filtering groups
-adlists = false       ; blocklist/allowlist URLs (the adlist definitions)
-domains = false       ; allow/deny exact+regex domains (auto-apply, no rebuild)
-clients = false       ; per-client group assignments (only useful with groups)
+#   groups  = filtering groups
+#   adlists = blocklist/allowlist URLs (the adlist definitions)
+#   domains = allow/deny exact+regex domains (auto-apply, no rebuild)
+#   clients = per-client group assignments (only useful with groups)
+groups = false
+adlists = false
+domains = false
+clients = false
 
 # Extra config-layer keys to mirror (comma/space-separated dotted paths).
 # These use the same zero-downtime PATCH as hosts/cnames — no gravity DB, no
-# reloads. Useful keys: dhcp.hosts (static DHCP leases, for a hot-standby),
-# dns.upstreams, dns.revServers. List values are shrink-guarded; every write is
-# verified and rolled back on failure. webserver.* is refused (it contains API
-# credentials and would cut the replica off).
+# reloads. Each key must name a LEAF value (a scalar or a list), e.g.
+# dhcp.hosts (static DHCP leases, for a hot-standby), dns.upstreams,
+# dns.revServers — NOT a whole subtree like "dhcp" or "dns". List values are
+# shrink-guarded; every write is verified and rolled back on failure.
+# webserver.* is refused (it holds API credentials and could lock holesync out).
 # config_keys = dhcp.hosts
 
 # A gravity rebuild is only needed to apply changed ADLIST *content*; allow/deny
@@ -51,33 +62,47 @@ clients = false       ; per-client group assignments (only useful with groups)
 # (heavier — downloads + parses every adlist on the replica).
 run_gravity = false
 
-# HTTP behaviour
-timeout = 8           ; seconds per fast (read/config) request
-write_timeout = 60    ; seconds for collection writes — these trigger a list
-                      ; reload on the replica and can be slow on constrained hardware
-retries = 3           ; attempts per fast request (backoff on 5xx/429/conn)
-verify_tls = true     ; set false only for self-signed https Pi-holes
+# HTTP behaviour (seconds). These are the code defaults; shown for reference.
+#   timeout        = per fast (read/config) request
+#   write_timeout  = per collection write (triggers a list reload on the replica;
+#                    raise to 60+ on slow/constrained hardware such as a NAS)
+#   gravity_timeout= per gravity rebuild (downloads + parses every adlist)
+#   retries        = attempts per fast request (backoff on 5xx/429/conn)
+#   verify_tls     = set false only for self-signed https Pi-holes
+timeout = 8
+write_timeout = 30
+gravity_timeout = 180
+retries = 3
+verify_tls = true
 
 [safety]
 # Guards that protect a healthy replica from a glitchy source.
-min_hosts = 1         ; refuse to sync if the source reports fewer host records
-max_shrink_pct = 50   ; refuse a write that deletes > this % of any collection
-                      ; (override for a genuine bulk delete with --force)
-shrink_min = 5        ; ...but always allow removing up to this many items, so
-                      ; normal edits to a small collection aren't blocked
-max_changes = 100     ; refuse > this many collection changes in one run (sanity
-                      ; bound on a pathological diff; override with --force)
-load_probe_max = 5    ; if a trivial request to a replica is slower than this many
-                      ; seconds, the replica is busy: defer gravity-collection
-                      ; writes to a later run (DNS-record sync still proceeds)
-backup_dir = /var/lib/holesync/backups   ; replica state is saved here before a write
-backup_keep = 30      ; rotations to retain per replica
+#   min_hosts      = refuse to sync if the source reports fewer host records
+#   max_shrink_pct = refuse a write that deletes > this % of any collection
+#                    (override for a genuine bulk delete with --force)
+#   shrink_min     = always allow removing up to this many items, so normal
+#                    edits to a small collection aren't blocked
+#   max_changes    = refuse > this many collection changes in one run (sanity
+#                    bound on a pathological diff; override with --force)
+#   load_probe_max = if a trivial request to a replica is slower than this many
+#                    seconds, the replica is busy: defer gravity-collection
+#                    writes to a later run (DNS-record sync still proceeds)
+#   backup_dir     = replica state is saved here before a write
+#   backup_keep    = rotations to retain per replica series
+min_hosts = 1
+max_shrink_pct = 50
+shrink_min = 5
+max_changes = 100
+load_probe_max = 5
+backup_dir = /var/lib/holesync/backups
+backup_keep = 30
 
 [log]
 file = /var/log/holesync.log
-level = info          ; debug|info|warning|error
-# Default /run/holesync/holesync.lock (created by the systemd unit's
-# RuntimeDirectory=, or by holesync itself; falls back to the temp dir if
-# unwritable). Kept out of /tmp so a systemd run with PrivateTmp=true and a
-# manual CLI run still exclude each other.
-lockfile = /run/holesync/holesync.lock
+# level: debug|info|warning|error
+level = info
+# lockfile: leave UNSET to use the privilege-aware default — root gets
+# /run/holesync/holesync.lock (created by the systemd unit's RuntimeDirectory=
+# or by holesync), non-root gets a per-user runtime dir. Set an explicit path
+# only if you need one; it must be writable by whoever runs holesync.
+# lockfile = /run/holesync/holesync.lock

@@ -141,6 +141,19 @@ class SafetyAbort(HolesyncError):
     pass
 
 
+class ConfigError(HolesyncError):
+    """A configuration mistake (exit 2), even when only detectable at runtime
+    — e.g. a config_keys entry the source doesn't have or that names a subtree."""
+
+
+class VerifyError(ApiError):
+    """A post-write read-back did not match what we wrote (exit 4)."""
+
+
+class LockError(HolesyncError):
+    """The lock path could not be opened (distinct from 'already held')."""
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers (unit-tested without a network)
 # --------------------------------------------------------------------------- #
@@ -225,6 +238,16 @@ def validate_source(src: DnsRecords, opts: Options) -> None:
                 raise SafetyAbort("source cname record rejected: %s" % err)
 
 
+def drastic_shrink(new_n: int, old_n: int, opts: Options) -> bool:
+    """True if shrinking a data set from ``old_n`` to ``new_n`` items trips the
+    drastic-shrink guard: more than ``shrink_min`` removed AND the result is
+    below ``max_shrink_pct`` of the original. Shared by every size-based guard
+    so they can't drift apart. (sync_collection uses a distinct DELETE-count
+    variant — it counts actual deletions, not the net size change.)"""
+    drop = old_n - new_n
+    return drop > opts.shrink_min and new_n < old_n * (1.0 - opts.max_shrink_pct / 100.0)
+
+
 def shrink_guard(src: DnsRecords, dst: DnsRecords, opts: Options) -> None:
     """Refuse a write that would shrink the replica's data set drastically.
 
@@ -237,11 +260,9 @@ def shrink_guard(src: DnsRecords, dst: DnsRecords, opts: Options) -> None:
     """
     if opts.force:
         return
-    threshold = 1.0 - (opts.max_shrink_pct / 100.0)
 
     def check(label: str, src_n: int, dst_n: int) -> None:
-        drop = dst_n - src_n
-        if drop > opts.shrink_min and src_n < dst_n * threshold:
+        if drastic_shrink(src_n, dst_n, opts):
             raise SafetyAbort(
                 "%s would drop %d -> %d (> %.0f%% shrink) — refusing without --force"
                 % (label, dst_n, src_n, opts.max_shrink_pct)
@@ -264,6 +285,27 @@ def walk_config(cfg: dict, path: str):
             return None
         cur = cur[part]
     return cur
+
+
+def config_values_equal(a, b) -> bool:
+    """Compare two config values. LISTS compare order-insensitively — Pi-hole
+    stores config lists (dns.hosts, dhcp.hosts, upstreams…) unordered, so a
+    reorder is not drift and must not trigger a needless rewrite or a false
+    verify failure. Scalars compare exactly."""
+    if isinstance(a, list) and isinstance(b, list):
+        return sorted(map(repr, a)) == sorted(map(repr, b))
+    return a == b
+
+
+def config_has_key(cfg: dict, path: str) -> bool:
+    """True if the dotted path is present (even if its value is null) — unlike
+    walk_config, which can't tell an absent key from a null-valued one."""
+    cur = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False
+        cur = cur[part]
+    return True
 
 
 def nest_config(path: str, value) -> dict:
@@ -354,7 +396,9 @@ class PiholeClient:
             timeout = self.opts.timeout
         if max_attempts is None:
             max_attempts = self.opts.retries
+        max_attempts = max(1, max_attempts)  # always attempt at least once
         last_exc: Optional[Exception] = None
+        status, payload = 0, {}  # bound even if the loop body never runs
         for attempt in range(1, max_attempts + 1):
             try:
                 status, raw = self._raw(method, path, body, timeout)
@@ -923,8 +967,8 @@ def _sync_dns_records(client: "PiholeClient", source: DnsRecords, opts: Options,
     LOG.error("[%s] dns post-write verification FAILED — rolling back", name)
     client.patch_dns_records(current, opts)
     rolled = records_equal(current, client.get_dns_records(), opts)
-    raise ApiError("[%s] dns verify failed; rollback %s"
-                   % (name, "succeeded" if rolled else "FAILED"))
+    raise VerifyError("[%s] dns verify failed; rollback %s"
+                      % (name, "succeeded" if rolled else "FAILED"))
 
 
 def _sync_config_extra(client: "PiholeClient", source: SourceState, opts: Options,
@@ -939,16 +983,14 @@ def _sync_config_extra(client: "PiholeClient", source: SourceState, opts: Option
     old: dict = {}
     for key, sval in source.config_extra.items():
         rval = walk_config(cfg, key)
-        if sval == rval:
+        if config_values_equal(sval, rval):
             continue
-        if isinstance(sval, list) and isinstance(rval, list) and not opts.force:
-            drop = len(rval) - len(sval)
-            if (drop > opts.shrink_min
-                    and len(sval) < len(rval) * (1.0 - opts.max_shrink_pct / 100.0)):
-                raise SafetyAbort(
-                    "config %s would drop %d -> %d entries (> %.0f%% shrink) — "
-                    "refusing without --force"
-                    % (key, len(rval), len(sval), opts.max_shrink_pct))
+        if (isinstance(sval, list) and isinstance(rval, list) and not opts.force
+                and drastic_shrink(len(sval), len(rval), opts)):
+            raise SafetyAbort(
+                "config %s would drop %d -> %d entries (> %.0f%% shrink) — "
+                "refusing without --force"
+                % (key, len(rval), len(sval), opts.max_shrink_pct))
         to_write[key] = sval
         old[key] = rval
     if not to_write:
@@ -968,7 +1010,8 @@ def _sync_config_extra(client: "PiholeClient", source: SourceState, opts: Option
     client.patch_config(tree)
 
     after = client.get_config()
-    bad = sorted(k for k, v in to_write.items() if walk_config(after, k) != v)
+    bad = sorted(k for k, v in to_write.items()
+                 if not config_values_equal(walk_config(after, k), v))
     if not bad:
         LOG.info("[%s] config keys synced: %s", name, ", ".join(sorted(to_write)))
         return True, True
@@ -980,8 +1023,8 @@ def _sync_config_extra(client: "PiholeClient", source: SourceState, opts: Option
             merge_config(tree, nest_config(key, val))
     if tree:
         client.patch_config(tree)
-    raise ApiError("[%s] config verify failed for %s; rollback attempted"
-                   % (name, ", ".join(bad)))
+    raise VerifyError("[%s] config verify failed for %s; rollback attempted"
+                      % (name, ", ".join(bad)))
 
 
 def _sync_gravity(client: "PiholeClient", source: SourceState, opts: Options,
@@ -1099,11 +1142,13 @@ def process_replica(rcfg: ReplicaConfig, source: SourceState, opts: Options, sta
     except SafetyAbort as e:
         LOG.error("[%s] safety abort: %s", rcfg.name, e)
         return Result(rcfg.name, ok=False, code=3, reason=str(e))
+    except VerifyError as e:
+        LOG.error("%s", e)
+        return Result(rcfg.name, ok=False, code=4, reason=str(e))
     except HolesyncError as e:
         # Client-raised errors already carry the "[name]" prefix; don't double it.
         LOG.error("%s", e)
-        return Result(rcfg.name, ok=False, code=4 if "verify failed" in str(e) else 1,
-                      reason=str(e))
+        return Result(rcfg.name, ok=False, code=1, reason=str(e))
     except Exception as e:  # noqa: BLE001 — isolate: one bad replica must not
         # abort the others (e.g. a KeyError from a malformed replica-side item).
         LOG.exception("[%s] unexpected error", rcfg.name)
@@ -1118,7 +1163,7 @@ def _read_password(section: configparser.SectionProxy, ctx: str) -> str:
         try:
             with open(os.path.expanduser(section["password_file"])) as fh:
                 return fh.read().strip()
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             raise HolesyncError("%s: cannot read password_file: %s" % (ctx, e))
     pw = section.get("password", "")
     if not pw:
@@ -1129,17 +1174,18 @@ def _read_password(section: configparser.SectionProxy, ctx: str) -> str:
 def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options, dict]:
     if not os.path.exists(path):
         raise HolesyncError("config file not found: %s" % path)
-    # interpolation=None: passwords may contain a literal '%'.
-    # inline_comment_prefixes: allow the ';'/'#' inline comments used throughout
-    # holesync.conf.example (default ConfigParser would fold them into the value).
-    cp = configparser.ConfigParser(
-        interpolation=None, inline_comment_prefixes=(";", "#"))
+    # interpolation=None: a password is taken literally, so a '%' needs no
+    # escaping. NOTE: we deliberately do NOT enable inline_comment_prefixes —
+    # that would truncate any password containing " #" or " ;". Comments must
+    # therefore be on their own line (configparser strips full-line ';'/'#' by
+    # default); holesync.conf.example uses full-line comments only.
+    cp = configparser.ConfigParser(interpolation=None)
     # read_file, not read(): read() silently ignores unreadable files, which
     # turns a permissions problem into a baffling "missing [source]" error.
     try:
         with open(path) as fh:
             cp.read_file(fh)
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         raise HolesyncError("cannot read %s: %s" % (path, e))
     except configparser.Error as e:
         raise HolesyncError("cannot parse %s: %s" % (path, e))
@@ -1164,9 +1210,15 @@ def load_config(path: str) -> tuple[ReplicaConfig, list[ReplicaConfig], Options,
         if sect in known:
             continue
         if sect.startswith("replica:") or sect.startswith("replica."):
-            name = sect[len("replica:"):]  # strip prefix once; keep dots in name
+            # Both prefixes are 8 chars; strip whichever matched, keep dots.
+            name = sect[len("replica:"):]
             if not name:
                 raise HolesyncError("[%s]: replica name must not be empty" % sect)
+            if any(r.name == name for r in replicas):
+                # Distinct sections resolving to the same name would share log
+                # lines and backup filenames (silent overwrite) — reject.
+                raise HolesyncError(
+                    "duplicate replica name %r (from section [%s])" % (name, sect))
             replicas.append(ReplicaConfig(
                 name=name,
                 url=require_url(sect),
@@ -1243,28 +1295,39 @@ def setup_logging(logcfg: dict, verbose: bool) -> None:
 
 
 def default_lock_path() -> str:
-    """Root gets /run/holesync (matches the systemd unit's RuntimeDirectory=);
-    unprivileged runs get a per-user runtime dir they can actually write, so the
-    default never triggers the noisy permission-fallback in acquire_lock."""
+    """Pick a lock path the caller can actually write.
+
+    Root gets /run/holesync (matches the systemd unit's RuntimeDirectory=).
+    Everyone else gets a per-user runtime dir — but only if it's genuinely
+    writable: XDG_RUNTIME_DIR can be INHERITED from another user (e.g. under
+    `sudo -u`) and point at a dir this user can't write, so fall through to the
+    temp dir in that case. The default must never land on an unwritable path,
+    because acquire_lock treats that as a hard failure (it will NOT silently
+    relocate the lock — that would defeat mutual exclusion)."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return "/run/holesync/holesync.lock"
-    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    return os.path.join(base, "holesync.lock")
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+        return os.path.join(xdg, "holesync.lock")
+    return os.path.join(tempfile.gettempdir(), "holesync.lock")
 
 
 def acquire_lock(path: str):
     """Take an exclusive advisory lock. Returns the open handle, or None if
-    another run already holds it. Opens without truncating (so a failed attempt
-    can't clobber the holder's PID) and never unlinks the file (unlink-then-
-    recreate is the classic flock race that lets two runs both 'hold' it)."""
+    another run already holds it. Raises LockError if the path can't be opened.
+
+    Opens without truncating (so a failed attempt can't clobber the holder's
+    PID) and never unlinks the file (unlink-then-recreate is the classic flock
+    race that lets two runs both 'hold' it). It deliberately does NOT fall back
+    to a different path on failure: a lock at an unexpected location excludes
+    nothing, so silently relocating it is worse than refusing to run."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         fh = open(path, "a+")
     except OSError as e:
-        fallback = os.path.join(tempfile.gettempdir(), "holesync.lock")
-        LOG.warning("lockfile %s unavailable (%s) — falling back to %s",
-                    path, e, fallback)
-        fh = open(fallback, "a+")
+        raise LockError(
+            "cannot open lockfile %s: %s — set [log] lockfile to a path you can "
+            "write, or run as the right user" % (path, e))
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -1309,7 +1372,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("config error: unknown replica(s): %s (known: %s)"
                   % (", ".join(unknown), ", ".join(sorted(byname))), file=sys.stderr)
             return 2
-        replicas = [byname[n] for n in args.replica]
+        seen: set = set()  # dedup repeated -r NAME, preserving first-seen order
+        replicas = [byname[n] for n in args.replica
+                    if not (n in seen or seen.add(n))]
 
     opts.dry_run = args.dry_run or args.check
     opts.force = args.force
@@ -1319,7 +1384,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # /tmp, so a /tmp lock can't exclude a manual CLI run. /run/holesync is
     # created by the unit's RuntimeDirectory= (and by acquire_lock otherwise).
     lock_path = logcfg.get("lockfile") or default_lock_path()
-    lock = acquire_lock(lock_path)
+    try:
+        lock = acquire_lock(lock_path)
+    except LockError as e:
+        LOG.error("%s", e)
+        return 2
     if lock is None:
         LOG.warning("another holesync run holds %s — exiting", lock_path)
         return 5
@@ -1338,10 +1407,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             if opts.config_keys:
                 cfg = sc.get_config()
                 for key in opts.config_keys:
-                    val = walk_config(cfg, key)
-                    if val is None:
-                        raise HolesyncError(
+                    if not config_has_key(cfg, key):
+                        raise ConfigError(
                             "source config has no key %r (check config_keys)" % key)
+                    val = walk_config(cfg, key)
+                    if isinstance(val, dict):
+                        raise ConfigError(
+                            "config_keys %r names a whole subtree; give a leaf "
+                            "value such as %s.<field> instead" % (key, key))
                     source.config_extra[key] = val
             if opts.sync_groups:
                 source.groups = sc.get_collection("groups")
@@ -1360,6 +1433,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         validate_source_collections(source, opts)
 
         results = [process_replica(r, source, opts, stamp) for r in replicas]
+    except ConfigError as e:
+        LOG.error("config error: %s", e)
+        return 2
     except HolesyncError as e:
         LOG.error("%s", e)
         return 1
